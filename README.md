@@ -47,7 +47,8 @@ against PAM. This requires, to ensure privilege separation, that ```rdpgw-auth``
 valid PAM configuration is provided per typical configuration.
 
 If NTLM authentication is used, the allowed user credentials for the gateway should be configured in the 
-configuration file of `rdpgw-auth`.
+configuration file of `rdpgw-auth`. Alternatively, `rdpgw-auth` can verify NTLM logons against Active Directory
+through Samba winbind, in which case no passwords are stored on the gateway.
 
 Finally, RDP hosts that the client wants to connect to are verified against what was provided by / allowed by
 the server. Next to that the client's ip address needs to match the one it obtained the gateway token with if
@@ -95,6 +96,9 @@ For detailed PAM setup including LDAP integration, container deployment, and com
 ### NTLM Authentication
 
 For detailed NTLM setup including user management, security considerations, and deployment options, see the [NTLM Authentication Documentation](docs/ntlm-authentication.md).
+NTLM logons can be verified against a local user list or against Microsoft Active Directory via Samba winbind
+(`Ntlm.Backend: winbind` in the `rdpgw-auth` configuration); see
+[Active Directory Authentication via Winbind](docs/ntlm-authentication.md#active-directory-authentication-via-winbind).
 
 ### Header Authentication (Proxy Integration)
 
