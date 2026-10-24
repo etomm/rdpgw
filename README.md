@@ -275,6 +275,16 @@ make
 make install
 ```
 
+## Continuous Integration
+
+GitHub Actions workflows are defined in `.github/workflows/`:
+
+* **Go** (`.github/workflows/go.yml`): builds and tests the Go code. Runs on pull requests against `master` and on version tags (`v*`). Uses concurrency groups so that new commits to an open PR cancel the previous in-progress run for that branch.
+* **Docker Image** (`.github/workflows/docker-image.yml`): builds and pushes multi-architecture (amd64, arm64) container images to GHCR (`ghcr.io`). Runs on pull requests against `master`, on version tags (`v*`), and can be triggered manually via `workflow_dispatch`.
+* **CodeQL** (`.github/workflows/codeql-analysis.yml`): runs a weekly scheduled security scan of the Go codebase (every Wednesday at 22:22 UTC) on the default branch.
+
+The repository also tracks `go.sum` in version control for reproducible builds.
+
 ## Testing locally
 A convenience docker-compose allows you to test the RDPGW locally. It uses [Keycloak](http://www.keycloak.org) 
 and [xrdp](http://www.xrdp.org) and exposes it services on port 9443. You will need to allow your browser
