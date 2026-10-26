@@ -1,0 +1,7 @@
+* text=auto eol=lf
+*.exe binary
+*.dll binary
+*.so binary
+*.o binary
+*.keytab binary
+*.tar binary
