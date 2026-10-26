@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -62,6 +63,8 @@ Ntlm:
     Timeout: 3
     StripDomain: true
     Separator: "+"
+    Spns:
+      - HTTP/rdpgw.example.com
 `)
 	c, err := load(p)
 	if err != nil {
@@ -74,8 +77,9 @@ Ntlm:
 		Timeout:             3,
 		StripDomain:         true,
 		Separator:           "+",
+		Spns:                []string{"HTTP/rdpgw.example.com"},
 	}
-	if c.Ntlm.Backend != NtlmBackendWinbind || c.Ntlm.Winbind != want {
+	if c.Ntlm.Backend != NtlmBackendWinbind || !reflect.DeepEqual(c.Ntlm.Winbind, want) {
 		t.Errorf("got %+v, want backend winbind with %+v", c.Ntlm, want)
 	}
 }

@@ -55,6 +55,9 @@ type WinbindConfig struct {
 	// Separator is the winbind separator configured in smb.conf
 	// ("winbind separator", default "\").
 	Separator string `koanf:"separator"`
+	// Spns is a list of Kerberos Service Principal Names (SPNs) to register
+	// in Active Directory and ensure are present in the keytab.
+	Spns []string `koanf:"spns"`
 }
 
 var Conf Configuration

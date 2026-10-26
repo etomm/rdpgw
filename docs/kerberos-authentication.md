@@ -143,7 +143,17 @@ Kerberos:
 #### Dynamic Keytab Loading & SPN Management
 When deploying with Active Directory winbind (`rdpgw-auth-winbind`), RDPGW supports dynamic keytab reloading. The gateway automatically detects updates to the keytab file (e.g. when Samba refreshes the machine account keytab or adds SPNs).
 
-Additionally, the startup script automatically inspects `rdpgw.yaml`'s `GatewayAddress` setting, extracts the gateway FQDN, automatically requests an SPN (`HTTP/<GatewayAddress>`), and registers it both in Active Directory and the keytab. Additional SPNs can be provided via the `KERBEROS_SPNS` environment variable.
+Additionally, the startup script automatically inspects `rdpgw.yaml`'s `GatewayAddress` setting, extracts the gateway FQDN, automatically requests an SPN (`HTTP/<GatewayAddress>`), and registers it both in Active Directory and the keytab. Additional SPNs can be configured directly in `rdpgw-auth.yaml` under `ntlm.winbind.spns` for the authentication helper container:
+
+```yaml
+ntlm:
+  backend: winbind
+  winbind:
+    spns:
+      - HTTP/alt-rdpgw.example.com
+```
+
+(Alternatively, the `KERBEROS_SPNS` environment variable is also supported for backward compatibility).
 
 ## Authentication Flow
 
