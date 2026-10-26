@@ -193,7 +193,7 @@ func checkPublicIP(host string, ip net.IP) error {
 }
 
 func (c *Config) NewHandler() *Handler {
-	if len(c.Hosts) < 1 {
+	if len(c.Hosts) < 1 && c.HostSelection != "any" {
 		log.Fatal("Not enough hosts to connect to specified")
 	}
 
