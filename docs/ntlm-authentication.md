@@ -128,6 +128,9 @@ Ntlm:
     Timeout: 10
     StripDomain: false
     Separator: "\\"
+    Spns:
+      - HTTP/rdpgw.example.com
+      - HTTP/alt-rdpgw.example.com
 ```
 
 | Key | Default | Meaning |
@@ -137,6 +140,7 @@ Ntlm:
 | `Ntlm.Winbind.Domain` | empty | Passed as `--domain`. Leave empty to use winbind's own domain. |
 | `Ntlm.Winbind.RequireMembershipOf` | empty | Passed as `--require-membership-of`. A group name (`DOMAIN\Group`) or SID. Only members of that group can log on. |
 | `Ntlm.Winbind.Timeout` | `10` | Seconds to wait for each reply from `ntlm_auth`. Must be positive. |
+| `Ntlm.Winbind.Spns` | empty | List of Service Principal Names (SPNs) automatically registered in Active Directory and added to the keytab by the winbind container startup script. |
 | `Ntlm.Winbind.StripDomain` | `false` | When `true`, the user name passed to the gateway is `alice` instead of `EXAMPLE\alice`. |
 | `Ntlm.Winbind.Separator` | `\` | The `winbind separator` from `smb.conf`, used by `StripDomain`. |
 

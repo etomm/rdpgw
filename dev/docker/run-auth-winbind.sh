@@ -65,17 +65,27 @@ if [ "${RDPGW_AUTH_EXTERNAL_WINBIND}" != "1" ]; then
   # Ensure keytab is created/refreshed initially
   net ads keytab create -P 2>/dev/null || true
 
-  # Determine any primary SPN from GatewayAddress if rdpgw.yaml is mounted/present
+  # Determine primary SPN from GatewayAddress if rdpgw.yaml is mounted/present
   ALL_SPNS=""
   RDPGW_CONF="${RDPGW_CONF:-/opt/rdpgw/rdpgw.yaml}"
   if [ -f "${RDPGW_CONF}" ]; then
-    GW_ADDR=$(grep -i '^[[:space:]]*GatewayAddress:' "${RDPGW_CONF}" | awk '{print $2}' | sed -e 's|^https\?://||' -e 's|:[0-9]\+.*$||' -e 's|/.*$||' | tr -d '\r\n')
+    GW_RAW=$(yq eval '.Server.GatewayAddress // .server.gatewayaddress // ""' "${RDPGW_CONF}" 2>/dev/null | tr -d '\r\n')
+    GW_ADDR=$(echo "${GW_RAW}" | sed -e 's|^https\?://||' -e 's|:[0-9]\+.*$||' -e 's|/.*$||')
     if [ -n "${GW_ADDR}" ] && [ "${GW_ADDR}" != "localhost" ] && [ "${GW_ADDR}" != "127.0.0.1" ]; then
       ALL_SPNS="HTTP/${GW_ADDR}"
     fi
   fi
 
-  # Append any additional KERBEROS_SPNS
+  # Extract additional SPNs from rdpgw-auth.yaml under ntlm.winbind.spns if present
+  AUTH_CONF="${RDPGW_AUTH_CONF:-/etc/rdpgw-auth.yaml}"
+  if [ -f "${AUTH_CONF}" ]; then
+    YAML_SPNS=$(yq eval '.ntlm.winbind.spns[]?' "${AUTH_CONF}" 2>/dev/null | tr '\n' ' ' || true)
+    if [ -n "${YAML_SPNS}" ]; then
+      ALL_SPNS="${ALL_SPNS} ${YAML_SPNS}"
+    fi
+  fi
+
+  # Append any legacy KERBEROS_SPNS env var if set
   if [ -n "${KERBEROS_SPNS}" ]; then
     ALL_SPNS="${ALL_SPNS} ${KERBEROS_SPNS}"
   fi
