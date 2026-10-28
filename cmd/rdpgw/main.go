@@ -141,6 +141,8 @@ func main() {
 	// configure tls security
 	if conf.Server.Tls == config.TlsDisable {
 		log.Printf("TLS disabled - rdp gw connections require tls, make sure to have a terminator")
+	} else if conf.Server.Tls == config.TlsTerminatedExternally {
+		log.Printf("TLS terminated externally - rdp gw connections require tls, make sure to have a terminator")
 	} else {
 		// auto config
 		tlsConfigured := false
@@ -342,7 +344,7 @@ func main() {
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)), // disable http2
 	}
 
-	if conf.Server.Tls == config.TlsDisable {
+	if conf.Server.Tls == config.TlsDisable || conf.Server.Tls == config.TlsTerminatedExternally {
 		err = server.ListenAndServe()
 	} else {
 		err = server.ListenAndServeTLS("", "")
