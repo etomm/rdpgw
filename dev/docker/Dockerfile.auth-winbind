@@ -26,7 +26,7 @@ FROM alpine:latest
 # ldb-tools provides ldb tools for secrets.ldb initialization,
 # and krb5 is needed to join and talk to the domain.
 RUN apk --no-cache add linux-pam musl tzdata ca-certificates \
-        samba-winbind samba-winbind-clients samba-common-tools ldb-tools krb5 su-exec yq-go && \
+        samba-winbind samba-winbind-clients samba-winbind-modules samba-common-tools ldb-tools krb5 su-exec yq-go && \
     addgroup -S winbindd_priv && \
     adduser -D -H -h /opt/rdpgw -u 1001 rdpgw && \
     addgroup rdpgw winbindd_priv
