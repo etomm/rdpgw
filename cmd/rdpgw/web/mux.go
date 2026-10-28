@@ -2,6 +2,7 @@ package web
 
 import (
 	"github.com/gorilla/mux"
+	"log"
 	"net/http"
 )
 
@@ -29,9 +30,13 @@ func (a *AuthMux) Register(headers []string, condition func(*http.Request) bool)
 }
 
 func (a *AuthMux) SetAuthenticate(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[AUTH DEBUG] %s %s | User-Agent: %q | Sec-WebSocket-Protocol: %q | Authorization: %q | RemoteAddr: %s",
+		r.Method, r.URL.Path, r.UserAgent(), r.Header.Get("Sec-WebSocket-Protocol"), r.Header.Get("Authorization"), r.RemoteAddr)
+
 	for _, authHeader := range a.headers {
 		// If condition is nil or condition returns true, add the header
 		if authHeader.condition == nil || authHeader.condition(r) {
+			log.Printf("[AUTH DEBUG] Advertising WWW-Authenticate: %s", authHeader.header)
 			w.Header().Add("WWW-Authenticate", authHeader.header)
 		}
 	}
