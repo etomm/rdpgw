@@ -54,8 +54,9 @@ func checkDefaultSecrets(c *Configuration) error {
 }
 
 const (
-	TlsDisable = "disable"
-	TlsAuto    = "auto"
+	TlsDisable               = "disable"
+	TlsAuto                  = "auto"
+	TlsTerminatedExternally  = "terminated-externally"
 
 	HostSelectionSigned     = "signed"
 	HostSelectionRoundRobin = "roundrobin"
