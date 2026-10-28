@@ -144,6 +144,9 @@ func (h *NTLMAuthHandler) NTLMAuth(next http.HandlerFunc) http.HandlerFunc {
                         return
 		}
 
+		log.Printf("[NTLM DEBUG] Received auth mode=%d payload_len=%d from %s",
+			authMode, len(authPayload), r.RemoteAddr)
+
 		authenticated, username := h.authenticate(w, r, authPayload, authMode)
 
 		if authenticated {
