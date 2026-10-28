@@ -10,7 +10,6 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"strings"
 
 	"github.com/bolkedebruin/gokrb5/v8/service"
 	"github.com/bolkedebruin/rdpgw/cmd/rdpgw/config"
@@ -300,21 +299,9 @@ func main() {
 		rdp.NewRoute().HeadersRegexp("Authorization", "NTLM").HandlerFunc(ntlmHandler)
 		if !conf.Server.KerberosEnabled() {
 			rdp.NewRoute().HeadersRegexp("Authorization", "Negotiate").HandlerFunc(ntlmHandler)
-			auth.Register([]string{`NTLM`, `Negotiate`}, func(r *http.Request) bool {
-				ua := r.UserAgent()
-				if strings.Contains(ua, "Android") || strings.Contains(ua, "MSRDClient") {
-					return true
-				}
-				return r.Header.Get("Sec-WebSocket-Protocol") != "binary" // rdp client for ios is incompatible with this NTLM method.
-			})
+			auth.Register([]string{`NTLM`, `Negotiate`}, nil)
 		} else {
-			auth.Register([]string{`NTLM`}, func(r *http.Request) bool {
-				ua := r.UserAgent()
-				if strings.Contains(ua, "Android") || strings.Contains(ua, "MSRDClient") {
-					return true
-				}
-				return r.Header.Get("Sec-WebSocket-Protocol") != "binary"
-			})
+			auth.Register([]string{`NTLM`}, nil)
 		}
 	}
 
