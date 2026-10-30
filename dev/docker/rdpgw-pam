@@ -2,4 +2,4 @@
 auth     sufficient pam_winbind.so
 auth     include    base-auth
 account  sufficient pam_winbind.so
-account  include    base-account
+account  sufficient pam_permit.so
