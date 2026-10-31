@@ -93,12 +93,30 @@ For detailed Kerberos setup including keytab generation, DNS requirements, and K
 
 For detailed PAM setup including LDAP integration, container deployment, and compatible clients, see the [PAM Authentication Documentation](docs/pam-authentication.md).
 
+`rdpgw-auth` can either use a hand-written PAM service file (`/etc/pam.d/rdpgw`, the
+classic setup that is never touched unless you opt in) or generate a stacked
+backend pipeline (winbind, LDAP, local unix users, static YAML users, each
+optionally gated by OATH 2FA) from a single `AuthProtocols.Basic` configuration.
+
 ### NTLM Authentication
 
 For detailed NTLM setup including user management, security considerations, and deployment options, see the [NTLM Authentication Documentation](docs/ntlm-authentication.md).
-NTLM logons can be verified against a local user list or against Microsoft Active Directory via Samba winbind
-(`Ntlm.Backend: winbind` in the `rdpgw-auth` configuration); see
+NTLM logons can be verified against a local user list or against Microsoft Active Directory
+via Samba winbind (`AuthProtocols.Ntlm.Backends: [winbind]` in the `rdpgw-auth` configuration;
+the legacy `Ntlm.Backend: winbind` schema keeps working); see
 [Active Directory Authentication via Winbind](docs/ntlm-authentication.md#active-directory-authentication-via-winbind).
+
+### rdpgw-auth configuration
+
+The `rdpgw-auth` helper supports one unified configuration for all identity
+protocols: `AuthProtocols` (Kerberos keytab sharing, ordered NTLM verifiers,
+stacked Basic/PAM pipelines) plus backend definitions (`Winbind`, named
+`Ldap` and `Oath` profiles, static `Users`). It also provisions `smb.conf`,
+`krb5.conf` and the PAM stack from that configuration, joins the AD domain,
+manages the shared keytab and SPNs, and supervises `winbindd`. Legacy
+configuration files without `AuthProtocols` keep working and are mapped
+automatically. See the
+[Advanced Authentication Configuration](docs/advanced-auth-configuration.md).
 
 ### Header Authentication (Proxy Integration)
 

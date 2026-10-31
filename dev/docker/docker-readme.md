@@ -34,21 +34,39 @@ docker --run name rdpgw bolkedebruin/rdpgw:latest \
   -v conf:/etc/rdpgw
 ```
 
-## NTLM authentication against Active Directory (winbind)
+## NTLM and Kerberos authentication against Active Directory (winbind)
 
 `Dockerfile.auth-winbind` builds an `rdpgw-auth` image that contains Samba
-winbind and `ntlm_auth`, for use with `Ntlm.Backend: winbind` (see
-[docs/ntlm-authentication.md](../../docs/ntlm-authentication.md)). It builds from
-the local source tree, so run the build from the repository root:
+winbind and `ntlm_auth`, for use with a winbind-capable configuration
+(`AuthProtocols.Ntlm`/`Kerberos`/`Basic` using the winbind backend, or the
+legacy `Ntlm.Backend: winbind`). It builds from the
+local source tree, so run the build from the repository root:
 
 ```bash
 docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth .
 ```
 
 The image is published both as `rdpgw-auth` and (legacy alias)
-`rdpgw-auth-winbind`; both tags point at the same build. Pass `--relaxed`
-to log provisioning drift instead of refusing to start (host/systemd
-deployments).
+`rdpgw-auth-winbind`; both tags point at the same build. See
+[docs/advanced-auth-configuration.md](../../docs/advanced-auth-configuration.md)
+for the configuration reference and
+[docs/ntlm-authentication.md](../../docs/ntlm-authentication.md) for the
+setup details.
+
+The entrypoint is the `rdpgw-auth` daemon itself, which fully provisions the
+container at startup: staged/reconciled `smb.conf` and `krb5.conf`, the
+generated PAM stack when `AuthProtocols.Basic` is enabled, the domain join
+(`AD_JOIN_USER`/`AD_JOIN_PASSWORD` with `Winbind.autojoin: true`, or a clean
+wait for a manual join), shared keytab refresh and SPN registration, and then
+`winbindd` supervision (`wbinfo -p` readiness, graceful stop on SIGTERM) with
+the gRPC server running as UID 1001. There is no shell startup script and no
+`yq`/`su-exec` anymore.
+
+The daemon's default configuration path is `/opt/rdpgw/rdpgw-auth.yaml` (its
+working directory); either mount the file there or pass the chosen path with
+`--conf`. It also accepts the usual flags (`-c`, `-s`, `--allow-uid`,
+`--allow-gid`, `--serve-user`) as container arguments; `--relaxed` downgrades
+file-drift explosions to warnings (for host/systemd deployments).
 
 `winbind` only works on a host that is joined to the domain. Choose one of two
 ways to provide that:
@@ -59,24 +77,25 @@ ways to provide that:
    from the configuration (operator files keep winning: missing settings are
    appended, values are never overwritten; a value that differs refuses to
    start, unless the daemon runs with `--relaxed`, which logs the drift and
-   keeps running - the mode designed for long-lived systemd services).
+   keeps running — the mode designed for long-lived systemd services).
 
    ```bash
    # Automatic join on first start:
    docker run -d --name rdpgw-auth --hostname rdpgw-auth \
      -e AD_JOIN_USER=Administrator -e AD_JOIN_PASSWORD=your_password \
-     -v ./smb.conf:/etc/samba/smb.conf:ro -v samba-state:/var/lib/samba \
-     -v ./rdpgw-auth.yaml:/etc/rdpgw-auth.yaml:ro \
+     -v ./rdpgw-auth.yaml:/opt/rdpgw/rdpgw-auth.yaml:ro \
+     -v samba-state:/var/lib/samba \
      -v auth-socket:/tmp \
      ghcr.io/example-org/rdpgw-auth:latest
 
    # Or manual one-time join via interactive exec:
    docker run --rm -it --entrypoint net \
-     -v ./smb.conf:/etc/samba/smb.conf:ro -v samba-state:/var/lib/samba \
+     -v samba-state:/var/lib/samba \
      ghcr.io/example-org/rdpgw-auth:latest ads join -U Administrator
    ```
 
-   Keep the NetBIOS name or container hostname stable (e.g. `netbios name = rdpgw-auth` in `smb.conf`): it is the computer account name in the domain.
+   Keep the machine account name stable
+   (`Winbind.hostname: rdpgw-auth` in the configuration): it is the computer account name in the domain.
 
 2. **Use the winbind of a domain-joined Docker host.** Set
    `RDPGW_AUTH_EXTERNAL_WINBIND=1` and mount the host's `/run/samba` and

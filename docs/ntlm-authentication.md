@@ -5,7 +5,10 @@ RDPGW supports NTLM authentication for simple setup with Windows clients. Creden
 - **File backend** (default): users and passwords are listed in the `rdpgw-auth` configuration file. Useful for small deployments with a limited number of users.
 - **Winbind backend**: the NTLM handshake is delegated to Samba's `ntlm_auth` helper, and a Microsoft Active Directory domain controller verifies the credentials. No passwords are stored on the gateway. See [Active Directory Authentication via Winbind](#active-directory-authentication-via-winbind).
 
-Both backends work with clients that are not joined to the domain.
+Both backends work with clients that are not joined to the domain, and both can be
+listed together as ordered, alternative verifiers in the modern
+`AuthProtocols.Ntlm` schema (see below). The legacy `Ntlm.Backend` schema keeps
+working unchanged.
 
 ## Advantages
 
@@ -35,18 +38,27 @@ Caps:
 
 ### 2. Authentication Helper Configuration
 
-Create configuration file for `rdpgw-auth` with user credentials:
+Create configuration file for `rdpgw-auth` with user credentials. The modern
+schema puts the protocol frontends under `AuthProtocols`:
 
 ```yaml
 # /etc/rdpgw-auth.yaml
+AuthProtocols:
+  Ntlm:
+    enabled: true
+    backends:
+      - "users"     # verify against the Users list below
+
 Users:
   - Username: "alice"
     Password: "secure_password_1"
   - Username: "bob"
     Password: "secure_password_2"
-  - Username: "admin"
-    Password: "admin_secure_password"
 ```
+
+The file backend also keeps working without an `AuthProtocols` block (legacy
+schema): a `Users` list with no `AuthProtocols` maps to the NTLM `users`
+backend.
 
 ### 3. Start Authentication Helper
 
@@ -77,7 +89,11 @@ gateway host has to be a member of the domain.
    sudo apt install winbind samba-common-bin krb5-user
    ```
 
-2. Configure `/etc/samba/smb.conf` as a domain member. A minimal example:
+2. Configure `/etc/samba/smb.conf` as a domain member. This is the manual
+   (host) path and keeps working exactly like before. When `rdpgw-auth` runs
+   with a winbind-capable configuration it can also generate/merge this file
+   for you at startup; see
+   [Automatic provisioning](#automatic-provisioning). A minimal example:
 
    ```ini
    [global]
@@ -117,8 +133,11 @@ gateway host has to be a member of the domain.
 
 ### Helper Configuration
 
+The legacy schema is still accepted verbatim (it applies whenever the file
+has no `AuthProtocols` block):
+
 ```yaml
-# /etc/rdpgw-auth.yaml
+# /etc/rdpgw-auth.yaml (legacy schema)
 Ntlm:
   Backend: winbind
   Winbind:
@@ -133,6 +152,40 @@ Ntlm:
       - HTTP/alt-rdpgw.example.com
 ```
 
+The equivalent modern configuration is:
+
+```yaml
+# /etc/rdpgw-auth.yaml (modern schema)
+Winbind:
+  domain: "example.com"           # FQDN of the domain; legacy `Domain: EXAMPLE`
+                                  # (the NetBIOS workgroup) maps to workgroup
+  workgroup: "EXAMPLE"
+  requiremembershipof: "EXAMPLE\\RDP Users"
+
+AuthProtocols:
+  Ntlm:
+    enabled: true
+    backends:
+      - "winbind"
+  Kerberos:
+    share: true                   # keep the shared keytab synchronized
+    spns:                         # legacy `Ntlm.Winbind.Spns` maps here
+      - HTTP/rdpgw.example.com
+      - HTTP/alt-rdpgw.example.com
+```
+
+With the modern schema, `rdpgw-auth` also understands `Winbind.hostname`
+(stable `netbios name` in `smb.conf`), `Winbind.domaincontrollers` (feeds the
+generated `krb5.conf`), `Winbind.autojoin` / `Winbind.jointimeout`, and the
+generated `smb.conf`; see the
+[configuration reference](advanced-auth-configuration.md) for the full list.
+
+Legacy mapping notes (applies only when `AuthProtocols` is missing):
+`Ntlm.Backend: winbind` enables both the winbind NTLM backend **and**
+`AuthProtocols.Kerberos` (`share: true` with the default shared keytab), and
+`Ntlm.Winbind.Spns` carry over to `AuthProtocols.Kerberos.Spns`, so the
+keytab/SPN management below runs the same way in both schemas.
+
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `Ntlm.Backend` | `file` | `file` verifies against the `Users` list, `winbind` delegates to `ntlm_auth`. |
@@ -140,9 +193,14 @@ Ntlm:
 | `Ntlm.Winbind.Domain` | empty | Passed as `--domain`. Leave empty to use winbind's own domain. |
 | `Ntlm.Winbind.RequireMembershipOf` | empty | Passed as `--require-membership-of`. A group name (`DOMAIN\Group`) or SID. Only members of that group can log on. |
 | `Ntlm.Winbind.Timeout` | `10` | Seconds to wait for each reply from `ntlm_auth`. Must be positive. |
-| `Ntlm.Winbind.Spns` | empty | List of Service Principal Names (SPNs) automatically registered in Active Directory and added to the keytab by the winbind container startup script. |
+| `Ntlm.Winbind.Spns` | empty | List of Service Principal Names (SPNs) automatically registered in Active Directory and added to the keytab by `rdpgw-auth`. |
 | `Ntlm.Winbind.StripDomain` | `false` | When `true`, the user name passed to the gateway is `alice` instead of `EXAMPLE\alice`. |
 | `Ntlm.Winbind.Separator` | `\` | The `winbind separator` from `smb.conf`, used by `StripDomain`. |
+
+The same fields exist in the modern schema as `Winbind.*`
+(`requiremembershipof`, `ntlmauthpath`, `timeout`, `stripdomain`, `separator`)
+plus `domain`, `workgroup`, `hostname`, `autojoin`, `jointimeout` and
+`domaincontrollers`; SPNs live under `AuthProtocols.Kerberos.Spns`.
 
 The `Users` list is ignored with the winbind backend; `rdpgw-auth` logs a warning
 when it is present.
@@ -248,22 +306,34 @@ ExecStart=/usr/local/bin/rdpgw-auth -c /etc/rdpgw-auth.yaml --relaxed
 SupplementaryGroups=winbindd_priv
 ```
 
+If the helper runs as root it can also manage winbindd itself (`autojoin`,
+keytab/SPN maintenance and supervision, see below); setting
+`RDPGW_AUTH_EXTERNAL_WINBIND=1` keeps delegating to the system winbind.
+
 ### Docker Deployment
 
 #### Using Winbind Backend with Persistent State & Auto-Join
 
-The `rdpgw-auth-winbind` container can automatically join Active Directory on startup, or wait cleanly for a manual one-time join without crashing. Domain join credentials can be supplied via environment variables:
+The `rdpgw-auth` container (published alongside the legacy `rdpgw-auth-winbind`
+alias tag) joins Active Directory on startup, provisions its configuration and
+supervises `winbindd` itself; the entrypoint is the daemon now, there is no
+shell startup script. Domain join credentials are supplied via environment
+variables:
 
 ```yaml
 # docker-compose.yml
 services:
   rdpgw-auth:
-    image: ghcr.io/example-org/rdpgw-auth-winbind:latest
+    image: ghcr.io/example-org/rdpgw-auth:latest
+    # No smb.conf to mount: rdpgw-auth generates /etc/samba/smb.conf and
+    # /etc/krb5.conf from the configuration below. Mounting your own is still
+    # possible; it must then contain the generated [global] settings (missing
+    # ones are merged into a writable mount; conflicting values refuse to start).
+    command: ["--conf", "/etc/rdpgw-auth.yaml"]
     environment:
       - AD_JOIN_USER=Administrator
       - AD_JOIN_PASSWORD=your_ad_password
     volumes:
-      - ./smb.conf:/etc/samba/smb.conf:ro
       - ./rdpgw-auth.yaml:/etc/rdpgw-auth.yaml:ro
       - samba-state:/var/lib/samba
       - auth-socket:/tmp
@@ -280,6 +350,10 @@ volumes:
   auth-socket:
   samba-state:
 ```
+
+The `--conf` flag is needed because the daemon's default configuration path is
+`/opt/rdpgw/rdpgw-auth.yaml` (its working directory); alternatively mount the
+file there.
 
 ### Kubernetes Deployment
 
@@ -312,7 +386,7 @@ spec:
         - name: auth-socket
           mountPath: /tmp
       - name: rdpgw-auth
-        image: ghcr.io/example-org/rdpgw-auth-winbind:latest
+        image: ghcr.io/example-org/rdpgw-auth:latest
         args:
           - -c
           - /etc/rdpgw-auth.yaml
@@ -338,8 +412,6 @@ spec:
         - name: config-volume
           mountPath: /etc/rdpgw-auth.yaml
           subPath: rdpgw-auth.yaml
-        - name: smb-conf
-          mountPath: /etc/samba
         - name: samba-state
           mountPath: /var/lib/samba
         - name: auth-socket
@@ -352,13 +424,26 @@ spec:
           claimName: rdpgw-samba-state-pvc
 ```
 
+Note the pod hostname is ephemeral; set `Winbind.hostname` in the
+configuration so the AD computer account name stays stable across pod
+restarts.
+
 #### Automatic vs. Manual Join Behavior
 
-- **Automatic Join**: When `AD_JOIN_USER` and `AD_JOIN_PASSWORD` are defined, the container checks `net ads testjoin`. If unjoined, it runs `net ads join` automatically during startup, saves the domain trust machine credentials to `/var/lib/samba/private/secrets.tdb`, and launches `winbindd`.
-- **Manual Join**: If join credentials are not defined in the environment, the container starts, creates required Samba directories (`/var/lib/samba/private`, `/var/lib/samba/winbindd_privileged`), and waits cleanly without crashlooping:
+- **Automatic Join**: With `AD_JOIN_USER` and `AD_JOIN_PASSWORD` defined and
+  `Winbind.autojoin: true`, the daemon checks `net ads testjoin` first; a
+  joined host is left alone. Otherwise it joins via `net ads join` with
+  exponential backoff (2s up to 30s) until the join budget
+  (`Winbind.jointimeout`, default 10 minutes) elapses. The trust secret is
+  persisted in `/var/lib/samba/private/secrets.tdb`, so restarts re-use the
+  existing join.
+- **Manual Join**: With `autojoin: false` (the default) the daemon logs the
+  manual instructions and waits instead of crash-looping:
   ```text
-  Domain join state (/var/lib/samba/private/secrets.tdb) not found.
-  Waiting for manual domain join (exec into the container and run: net ads join -U Administrator)...
+  Domain join: join domain "example.com" by executing inside this container:
+      net ads join -U Administrator
+  or provide AD_JOIN_USER and AD_JOIN_PASSWORD (with autoJoin: true) so the daemon can do it
+  Domain join: waiting up to 10m0s for the join before giving up
   ```
   You can exec into the container and run `net ads join -U Administrator`
   manually. As soon as the join is detected, `rdpgw-auth` continues: keytab
@@ -366,6 +451,27 @@ spec:
   gRPC server follow. If the budget expires without a join, the daemon exits
   with a remediation playbook.
 - **Persistent Trust**: Because `/var/lib/samba` is mounted on a persistent volume, domain join is a one-time operation. Pod restarts will automatically detect the existing join state (`net ads testjoin`) and start immediately without re-joining.
+
+#### Automatic provisioning
+
+A winbind-capable `rdpgw-auth` generates or merges its own system files
+before the join:
+
+- `/etc/krb5.conf` from `Winbind.domain` and `Winbind.domaincontrollers`;
+- `/etc/samba/smb.conf` with the domain member `[global]` settings, including
+  the shared-keytab directives when `AuthProtocols.Kerberos.share: true`;
+- `/etc/pam.d/rdpgw` when `AuthProtocols.Basic` is enabled.
+
+Operator-provided files keep winning: missing generated settings are
+appended (into `[global]` for smb.conf; for krb5.conf single relations go
+inside their section and a missing realm block is appended whole, exactly as
+generated) and existing values are never overwritten. A value
+that differs from the generated one stops the daemon with an error naming
+every conflict — containers fail fast at deploy time; on a systemd host pass
+`--relaxed` to turn the same drift into a loud warning and keep running.
+Mounting your own `smb.conf` is therefore still possible — it just has to
+match the configuration unless you run `--relaxed`. See
+[docs/advanced-auth-configuration.md](advanced-auth-configuration.md).
 
 ## Client Configuration
 

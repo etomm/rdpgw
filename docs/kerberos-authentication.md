@@ -44,6 +44,13 @@ Before joining domains or generating keytabs, ensure `/etc/krb5.conf` is properl
     your.realm = YOUR.REALM
 ```
 
+Manual configuration like this is the classic path and keeps working. When
+`rdpgw-auth` runs with winbind capability it also **provisions** this file
+from its own configuration (`Winbind.domain` + `Winbind.domaincontrollers`) —
+missing relations are merged in, existing values are never overwritten — so
+the auth container does not need it mounted; mounted custom files keep
+winning.
+
 > 💡 **Multiple KDCs / Domain Controllers**: If you need to specify multiple KDC or administration servers for redundancy, you can repeat the `kdc` and `admin_server` entries within the realm block. With a winbind-capable `rdpgw-auth`, list them under `Winbind.domaincontrollers` instead and they end up in the generated file.
 
 ### 2. Domain Join & Service Principal Creation
@@ -51,8 +58,8 @@ Before joining domains or generating keytabs, ensure `/etc/krb5.conf` is properl
 Service principals (SPNs) identify the gateway service in the Kerberos realm. Depending on your environment, choose one of the following methods:
 
 #### Method A: Active Directory Domain Join & Samba (`net ads`)
-When using `rdpgw-auth-winbind` or a domain-joined Linux gateway, joining the domain automatically creates the computer object and principal in Active Directory.
-- **`net ads setspn add`**: Note that running `net ads setspn add` (or letting the container startup script automatically manage SPNs based on `GatewayAddress`) registers the SPN directly on the domain computer object in Active Directory on the Domain Controller (DC), not just locally in the keytab.
+When using `rdpgw-auth` with the winbind backend or a domain-joined Linux gateway, joining the domain automatically creates the computer object and principal in Active Directory.
+- **`net ads setspn add`**: Note that running `net ads setspn add` (or letting `rdpgw-auth` automatically manage SPNs based on `GatewayAddress` and the configured SPN list) registers the SPN directly on the domain computer object in Active Directory on the Domain Controller (DC), not just locally in the keytab.
 
 ```bash
 # Join domain (if not already joined via AD_JOIN_USER env var)
@@ -63,7 +70,9 @@ net ads setspn add HTTP/rdpgw.example.com -U Administrator
 ```
 
 #### Method B: Classic Active Directory / MIT Kerberos (`setspn` / `kadmin`)
-For standalone service accounts or MIT Kerberos KDCs:
+For standalone service accounts or MIT Kerberos KDCs — or when you prefer
+managing keytabs by hand instead of letting `rdpgw-auth` share the Samba
+machine keytab — the classic tooling keeps working:
 
 ```bash
 # Active Directory (registers SPN on service-account in DC)
@@ -140,49 +149,50 @@ Kerberos:
   Krb5conf: /etc/kerberos/krb5.conf
 ```
 
-#### Shared keytab and krb5.conf
-When `rdpgw-auth` shares the keytab (`AuthProtocols.Kerberos.Share: true`), it
-also publishes the generated `krb5.conf` for the gateway. The destination is
-`AuthProtocols.Kerberos.Krb5ConfPath`; when it is unset, the file is written
-next to the shared keytab as `krb5.conf` (so the default keytab publishes to
-`/var/lib/samba/krb5.conf`). Both files then travel through the same shared
-volume:
+#### Keytab sharing & SPN management
 
-```yaml
-# rdpgw-auth.yaml
-AuthProtocols:
-  Kerberos:
-    Share: true
-    KeytabPath: /var/lib/samba/rdpgw.keytab
-    # Krb5ConfPath defaults to /var/lib/samba/krb5.conf
-```
+When the auth side shares the Samba machine keytab
+(`AuthProtocols.Kerberos.Share: true` in `rdpgw-auth.yaml`), `rdpgw-auth`
+generates the matching `smb.conf` directives, keeps the machine keytab
+synchronized (`net ads keytab create -P`), registers missing SPNs in Active
+Directory when join credentials are available, ensures each SPN shows up in
+the keytab, and makes the keytab mode `0644` so the gateway can read it
+through the shared volume. The gateway picks up the refreshed keytab
+dynamically via its `Kerberos: Keytab` setting above.
 
-```yaml
-# rdpgw.yaml
-Kerberos:
-  Keytab: /var/lib/samba/rdpgw.keytab
-  Krb5conf: /var/lib/samba/krb5.conf
-```
+The same share also publishes the reconciled `krb5.conf` to
+`AuthProtocols.Kerberos.Krb5ConfPath`. It defaults to
+`dir(KeytabPath)/krb5.conf` (`/var/lib/samba/krb5.conf` with the default
+keytab), so the gateway can read both files from the same volume. Point
+`Kerberos.Krb5conf` at that path; the gateway reloads it when it changes,
+including when `rdpgw-auth` rewrites it on restart.
 
-The gateway reloads `krb5.conf` when its modtime or size changes, so KDC or
-realm updates published by `rdpgw-auth` are picked up without restarting the
-gateway. If the file does not exist yet, the KDC proxy keeps running and
-retries on subsequent requests instead of failing at startup.
+SPNs are collected from, in order:
 
-#### Dynamic Keytab Loading & SPN Management
-When deploying with Active Directory winbind (`rdpgw-auth-winbind`), RDPGW supports dynamic keytab reloading. The gateway automatically detects updates to the keytab file (e.g. when Samba refreshes the machine account keytab or adds SPNs).
+1. the `AuthProtocols.Kerberos.Spns` list in `rdpgw-auth.yaml`:
 
-Additionally, the startup script automatically inspects `rdpgw.yaml`'s `GatewayAddress` setting, extracts the gateway FQDN, automatically requests an SPN (`HTTP/<GatewayAddress>`), and registers it both in Active Directory and the keytab. Additional SPNs can be configured directly in `rdpgw-auth.yaml` under `ntlm.winbind.spns` for the authentication helper container:
+   ```yaml
+   AuthProtocols:
+     Kerberos:
+       share: true
+       keytabPath: /var/lib/samba/rdpgw.keytab
+       spns:
+         - HTTP/rdpgw.example.com
+         - HTTP/alt-rdpgw.example.com
+   ```
 
-```yaml
-ntlm:
-  backend: winbind
-  winbind:
-    spns:
-      - HTTP/alt-rdpgw.example.com
-```
+2. the legacy `KERBEROS_SPNS` environment variable (comma or space separated),
+   still supported for backward compatibility;
+3. the gateway FQDN: `rdpgw-auth` reads `RDPGW_CONF` (default
+   `/opt/rdpgw/rdpgw.yaml`), extracts `Server.GatewayAddress` and derives
+   `HTTP/<host>` (the legacy container behavior, kept as-is).
 
-(Alternatively, the `KERBEROS_SPNS` environment variable is also supported for backward compatibility).
+The legacy `ntlm.winbind.spns` field in `rdpgw-auth.yaml` still works and maps
+into `AuthProtocols.Kerberos.Spns` automatically. Missing SPNs that cannot be
+registered automatically are logged with the exact manual steps
+(`setspn -A <spn> DOMAIN\COMPUTER$` on a Windows DC, or
+`net ads setspn add <spn> -U Administrator` inside the container) and the
+daemon waits until the SPN appears.
 
 ## Authentication Flow
 

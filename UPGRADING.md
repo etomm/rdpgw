@@ -2,31 +2,142 @@
 
 ## Unreleased
 
-### Provisioning drift (`--relaxed`) and the krb5.conf merge
+### The auth container entrypoint is `rdpgw-auth` itself (no shell startup script)
 
-When the configuration has winbind capability, `rdpgw-auth` reconciles
-`smb.conf` and `/etc/krb5.conf` against the generated settings before
+`dev/docker/run-auth-winbind.sh`, `yq-go` and `su-exec` are gone. The
+`Dockerfile.auth-winbind` entrypoint is now
+`["/opt/rdpgw/rdpgw-auth", "--serve-user", "rdpgw"]`; everything the script
+did is inside the daemon:
+
+* provisioning/reconciliation of `smb.conf` and `krb5.conf`,
+* domain join (`net ads testjoin` pre-check, auto-join with exponential
+  backoff or a bounded wait for a manual join),
+* shared keytab refresh, SPN registration and keytab permissions (`0644`),
+* generation of the PAM stack when `AuthProtocols.Basic` is enabled,
+* `winbindd` supervision (readiness via `wbinfo -p`, graceful stop on
+  SIGTERM/SIGINT), with `RDPGW_WINBIND_PATH` and `RDPGW_WINBIND_DEBUG` as
+  deployment overrides,
+* `RDPGW_AUTH_EXTERNAL_WINBIND=1` still selects the host-provided winbindd
+  compatibility mode (wait-only, 30s ready timeout).
+
+Container arguments are forwarded to the same flags as before, so
+`-c /etc/rdpgw-auth.yaml -s /tmp/rdpgw-auth.sock --allow-uid 1001`
+manifests keep working. The daemon's default configuration path is
+`rdpgw-auth.yaml` relative to its working directory
+(`/opt/rdpgw/rdpgw-auth.yaml` in the image) — manifests that mount the config
+to `/etc/rdpgw-auth.yaml` without a `-c` flag must now pass
+`-c /etc/rdpgw-auth.yaml` explicitly.
+
+### rdpgw-auth images are published as `rdpgw-auth` (legacy alias kept)
+
+CI publishes `ghcr.io/<owner>/rdpgw-auth:<tag>` and keeps publishing the same
+build as the legacy alias `rdpgw-auth-winbind:<tag>` (plus `latest` tags for
+version pushes), so existing references keep resolving. Prefer `rdpgw-auth`
+going forward.
+
+### Unified `AuthProtocols` configuration for the auth daemon
+
+`rdpgw-auth` now has one schema for all identity protocols:
+
+```yaml
+AuthProtocols:
+  Kerberos:  # shared keytab for the gateway + SPN management
+    share: true
+    keytabPath: /var/lib/samba/rdpgw.keytab
+    spns: [HTTP/rdpgw.example.com]
+  Ntlm:      # ordered NTLM verifiers: winbind and/or users
+    enabled: true
+    backends: [winbind, users]
+  Basic:     # generated PAM stack: winbind, ldap, unix, users (+ OATH 2FA)
+    enabled: true
+    stack: [{backend: unix}]
+```
+
+Legacy configurations keep working unchanged: without an `AuthProtocols`
+block the legacy `Ntlm:` schema is mapped automatically (`Ntlm.Backend:
+winbind` also enables the Kerberos keytab share; `Ntlm.Winbind.Spns` move to
+`AuthProtocols.Kerberos.Spns`; `Ntlm.Winbind.Domain` maps to the modern
+`Winbind.workgroup`, so a FQDN now belongs in `Winbind.domain`). Multiple
+NTLM backends are tried in configured order per handshake; a backend chain
+that cannot be built is an explicit denial instead of a silent fallback.
+See [docs/advanced-auth-configuration.md](docs/advanced-auth-configuration.md).
+
+### rdpgw-auth provisions `smb.conf` and `krb5.conf` (strict drift policy)
+
+When the configuration has winbind capability, the daemon stages generated
+`smb.conf`/`krb5.conf` under `/tmp/rdpgw/` and reconciles the targets before
 joining:
 
+* a missing target is installed;
 * a writable target gets the generated settings it lacks **appended**
   (inside `[global]` for smb.conf; for krb5.conf single relations go inside
   their section and a missing realm block is appended as one collected
-  `{ ... }` unit); existing operator values are **never overwritten**;
+  `{ … }` unit): existing operator values are **never overwritten** — and
+  krb5.conf in particular is no longer regenerated wholesale when it is
+  writable; its merge treats each `[realms]` block as one value (realm
+  names must be upper case; a case-only difference is drift, never a
+  duplicate block), per
+  [docs/configuration-provisioning.md](docs/configuration-provisioning.md);
 * a setting the operator defined differently is drift: with the default
   strict policy (for `smb.conf` and `krb5.conf` alike) this stops the
-  daemon - the error names every conflicting setting;
+  daemon — the error names every conflicting setting;
 * settings that cannot be appended (a read-only target, or a `[global]`
   section ending in a continuation backslash) also stop the daemon in
   strict mode; a read-only file that already carries everything is accepted
   without writing;
 * with **`--relaxed`** all of the above drift becomes a warning instead of an
-  exit - the daemon keeps running and logs exactly what differs. Operator
+  exit — the daemon keeps running and logs exactly what differs. Operator
   values stay untouched in every mode.
 
-`krb5.conf` is no longer regenerated wholesale when writable: its merge
-treats each `[realms]` block as one value (realm names must be upper case; a
-case-only difference is drift, never a duplicate block). See
-[docs/configuration-provisioning.md](docs/configuration-provisioning.md).
+If you mount a hand-written `smb.conf` into the winbind container, make sure
+it carries the same values the configuration produces (realm, workgroup,
+`netbios name` via `Winbind.hostname`, separator, and with a keytab share
+`kerberos method` / `dedicated keytab file` / `sync machine password to
+keytab`), or leave it out and let the daemon generate it. Advanced settings
+such as `Winbind.hostname`, `Winbind.domaincontrollers`, `autojoin`,
+`jointimeout` and `requiremembershipof` feed the generated files. Only a
+strict-mode (there: container) deployment stops on drift; `--relaxed`
+deployments degrade loudly instead of crash-looping over a mount they
+cannot rewrite.
+
+### PAM stack generation and overwrite when `AuthProtocols.Basic` is enabled
+
+Enabling `AuthProtocols.Basic` makes `rdpgw-auth` generate
+`/etc/pam.d/rdpgw` on every start together with `/tmp/rdpgw/users.pwd`
+(SHA-512 crypt of the YAML `Users`), per-profile LDAP client files and
+`/opt/rdpgw/session_manager.sh` (a `pam_exec` helper that keeps the PAM
+account phase on the backend that won the auth phase). Local edits to the
+generated file are overwritten.
+
+**Not enabling `AuthProtocols.Basic` is the legacy behavior**: the daemon
+never touches `/etc/pam.d/rdpgw`, so hand-written PAM configurations,
+traditional `pam_ldap.conf`-based LDAP stacks and custom module setups keep
+working untouched.
+
+### Domain join timing is now governed by the configuration
+
+Previously the container joined (or waited indefinitely) based on whether
+`AD_JOIN_USER`/`AD_JOIN_PASSWORD` were set in the environment. The policy now
+comes from `Winbind.autojoin` / `Winbind.jointimeout` (default: manual join
+with a 10-minute wait budget, after which the daemon exits with a remediation
+playbook):
+
+* `autojoin: true` + both env vars: automatic join retries with exponential
+  backoff (2s → 30s) within the join budget;
+* `autojoin: false` (default): the daemon logs the manual instructions and
+  waits for an operator `net ads join`, then exits if the budget expires.
+
+Existing Kubernetes secrets with those names keep working; just set
+`Winbind.autojoin: true` to restore the automatic-join behavior.
+
+### SPN configuration moved to `AuthProtocols.Kerberos.Spns`
+
+SPNs are a Kerberos concern and now live under `AuthProtocols.Kerberos`.
+The daemon registers missing SPNs from that list, the legacy `KERBEROS_SPNS`
+environment variable, and `HTTP/<GatewayAddress>` derived from the gateway
+configuration (`RDPGW_CONF`, default `/opt/rdpgw/rdpgw.yaml`) — the same
+sources the removed startup script used. The legacy
+`Ntlm.Winbind.Spns` field keeps working via the legacy mapping.
 
 ### Container image no longer bakes a TLS cert and runs as UID 1001
 

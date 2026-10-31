@@ -11,6 +11,9 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 ---
 
 ## Milestone 1: Winbind Configuration Schema & Kerberos Share
+### Status
+- Delivered in `b5cb193` on `feature/milestone-2-smb-krb5-templates` (M1 and M2 share the branch).
+
 ### Scope
 - Implement Go struct definitions for `WinbindConfig` (including domain controllers list supporting both string lists and detailed host/port objects, and explicit NetBIOS/hostname management).
 - Implement `AuthProtocols.Kerberos` (`share: true/false`, `keytabPath`).
@@ -23,6 +26,9 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 ---
 
 ## Milestone 2: Go-Based Template Engine (`smb.conf` & `krb5.conf`)
+### Status
+- Delivered in `b5cb193` on `feature/milestone-2-smb-krb5-templates`.
+
 ### Scope
 - Implement file staging in `/tmp/rdpgw/` and mount safety checks (detecting read-only operator mounts).
 - Build the Go template engine using embedded templates (`smb.conf.tmpl`, `krb5.conf.tmpl`).
@@ -93,6 +99,7 @@ Go supervisor before the join logic moves.
 ## Milestone 5: Modular PAM Stack Generation & Static Users (`users.pwd`)
 ### Status
 - Delivered on `feature/milestone-5-pam-stack`.
+- The two module-invocation fixes discovered by the M6 container smoke test (`pwdfile=<path>` for `pam_pwdfile`, `pam_exec.so` for the session manager) are part of this branch's commit, so the milestone is self-consistent on its own.
 
 ### Scope
 - Implement static YAML users to `pam_pwdfile` integration (`users.pwd` generation under `/tmp/rdpgw/`).
@@ -117,8 +124,12 @@ Go supervisor before the join logic moves.
 ### Status
 - Delivered on `feature/milestone-6-container`.
 - Verified locally: the image builds, the binary is PID 1 as root with the gRPC server as UID 1001, the generated PAM stack is installed, and a real gRPC `Authenticate` call with the `users` backend succeeds for the right password and is denied for a wrong one. SIGTERM produces a clean shutdown.
-- The container check also caught and fixed two PAM invocation bugs from Milestone 5: `pam_pwdfile` needs `pwdfile=<path>`, and the session manager must be invoked through `pam_exec.so`.
-- Remaining operator step: the K3s end-to-end check needs the image published (CI) and the cluster manifests updated; both live outside this repository.
+- Verified on K3s: the image was imported into `test-node` and run as a temporary pod (no change to the production ArgoCD app). The pod generated its PAM stack and a gRPC `Authenticate` call through it succeeded for `smoke` with the right password and was denied for a wrong one. The temporary pod, ConfigMap and imported image were removed afterwards.
+- Remaining operator steps (blocked on credentials/approval):
+  1. Publish the image (CI runs on pull requests/tags): the registry credentials are not available here.
+  2. Update the deployment ArgoCD manifest to `ghcr.io/example-org/rdpgw-auth:latest` and add the `AuthProtocols.Basic` stack (winbind for AD Basic auth) once the image is published. The deployment repo is GitOps-managed, so committing before publication would roll the production app to an unpullable image.
+  3. Verify NTLM/Kerberos end-to-end from an RDP client with a real domain account; that needs AD credentials and a client, neither of which is available to the agent.
+- The container check also caught and fixed two PAM invocation bugs from Milestone 5: `pam_pwdfile` needs `pwdfile=<path>`, and the session manager must be invoked through `pam_exec.so` (the fixes now live on the M5 branch).
 
 ### Scope
 - Absorb the last shell block: `cmd/auth/samba.go` creates the samba runtime directories, ownership (`private` root-only, `winbindd_privileged` for the group) and `secrets.ldb` before the join.

@@ -94,7 +94,9 @@ skip `pam_permit` and the final `pam_deny` rejects the login.
 
 ### 1. PAM Service Configuration
 
-Create `/etc/pam.d/rdpgw` for the authentication service:
+**Classic, hand-written** — create `/etc/pam.d/rdpgw` for the authentication
+service (this is what `rdpgw-auth` uses whenever `AuthProtocols.Basic` is not
+enabled):
 
 **Local passwd authentication:**
 ```plaintext
@@ -113,6 +115,14 @@ account required pam_ldap.so
 auth sufficient pam_winbind.so
 account sufficient pam_winbind.so
 ```
+
+Modules can be stacked the same standard way (e.g. `pam_winbind` with
+`sufficient` followed by a local fallback).
+
+**Modern, generated** — enable `AuthProtocols.Basic` in `rdpgw-auth.yaml`
+instead (see [PAM stack: hand-written or generated](#pam-stack-hand-written-or-generated))
+and skip this step entirely: the file is generated from the configured stack
+and overwritten on every start.
 
 ### 2. Gateway Configuration
 
