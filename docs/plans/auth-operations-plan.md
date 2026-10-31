@@ -68,6 +68,7 @@ Go supervisor before the join logic moves.
 - Migrate the join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join/`.
 - Migrate keytab creation and SPN management into `cmd/auth/join/`: refresh the keytab (`net ads keytab create -P`), collect SPNs from `AuthProtocols.Kerberos.Spns` (legacy `ntlm.winbind.spns` maps there), `KERBEROS_SPNS` and `HTTP/<GatewayAddress>` from `RDPGW_CONF`, register missing SPNs with the join credentials, otherwise print manual instructions and wait for them to appear in `klist -k`, then make the keytab readable by the gateway (0644).
 - When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy would leave both lines on a writable mis-pointed operator file; samba reads them ambiguously). The authoritative directives are `kerberos method`, `dedicated keytab file` and `sync machine password to keytab`.
+- The remaining filesystem/`secrets.ldb` preparation and the entrypoint replacement stay in `run-auth-winbind.sh` for Milestone 6 (container streamlining), together with the `yq-go`/`su-exec` removal.
 
 #### Deliverables
 - `cmd/auth/join/` (domain join, keytab and SPN management), the in-place keytab rewrite in `cmd/auth/provisioning/`, and the corresponding script cleanup.
@@ -75,6 +76,10 @@ Go supervisor before the join logic moves.
 ---
 
 ## Milestone 4: NTLM Backends & Ordering
+### Status
+- Implementation landed with the configuration work (`b5cb193`): `cmd/auth/ntlm/orderedbackend.go`, `nullbackend.go` and `newNtlmBackend` in `cmd/auth/auth.go`.
+- Verified on `feature/milestone-4-ntlm-backends`; coverage lives in `orderedbackend_test.go` and `backendcompat_test.go`.
+
 ### Scope
 - Implement `AuthProtocols.Ntlm` parsing and execution.
 - Support ordered backend execution for NTLM (`winbind`, `users` as alternative/exclusive verifiers).
