@@ -301,9 +301,13 @@ func main() {
 		rdp.NewRoute().HeadersRegexp("Authorization", "NTLM").HandlerFunc(ntlmHandler)
 		if !conf.Server.KerberosEnabled() {
 			rdp.NewRoute().HeadersRegexp("Authorization", "Negotiate").HandlerFunc(ntlmHandler)
-			auth.Register([]string{`NTLM`, `Negotiate`}, nil)
+			auth.Register([]string{`NTLM`, `Negotiate`}, func(r *http.Request) bool {
+				return r.Header.Get("Sec-WebSocket-Protocol") != "binary" // rdp client for ios is incompatible with this NTLM method.
+			})
 		} else {
-			auth.Register([]string{`NTLM`}, nil)
+			auth.Register([]string{`NTLM`}, func(r *http.Request) bool {
+				return r.Header.Get("Sec-WebSocket-Protocol") != "binary"
+			})
 		}
 	}
 
