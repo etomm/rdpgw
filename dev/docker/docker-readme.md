@@ -42,8 +42,11 @@ winbind and `ntlm_auth`, for use with `Ntlm.Backend: winbind` (see
 the local source tree, so run the build from the repository root:
 
 ```bash
-docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth-winbind .
+docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth .
 ```
+
+The image is published both as `rdpgw-auth` and (legacy alias)
+`rdpgw-auth-winbind`; both tags point at the same build.
 
 `winbind` only works on a host that is joined to the domain. Choose one of two
 ways to provide that:
@@ -58,12 +61,12 @@ ways to provide that:
      -v ./smb.conf:/etc/samba/smb.conf:ro -v samba-state:/var/lib/samba \
      -v ./rdpgw-auth.yaml:/etc/rdpgw-auth.yaml:ro \
      -v auth-socket:/tmp \
-     ghcr.io/example-org/rdpgw-auth-winbind:latest
+     ghcr.io/example-org/rdpgw-auth:latest
 
    # Or manual one-time join via interactive exec:
    docker run --rm -it --entrypoint net \
      -v ./smb.conf:/etc/samba/smb.conf:ro -v samba-state:/var/lib/samba \
-     ghcr.io/example-org/rdpgw-auth-winbind:latest ads join -U Administrator
+     ghcr.io/example-org/rdpgw-auth:latest ads join -U Administrator
    ```
 
    Keep the NetBIOS name or container hostname stable (e.g. `netbios name = rdpgw-auth` in `smb.conf`): it is the computer account name in the domain.

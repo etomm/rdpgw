@@ -111,8 +111,39 @@ func stageFor(t *testing.T, conf config.Configuration) (stagedSmb, stagedKrb5 st
 
 func TestProvisionSkippedWithoutWinbind(t *testing.T) {
 	conf := config.Configuration{}
-	if Provision(conf) != nil {
+	if Provision(conf, Options{}) != nil {
 		t.Fatal("provisioning must be a no-op without any winbind capability")
+	}
+}
+
+func TestProvisionPreparesStateOnlyWhenManaged(t *testing.T) {
+	original := prepareSambaState
+	t.Cleanup(func() { prepareSambaState = original })
+
+	called := false
+	prepareSambaState = func() error {
+		called = true
+		return nil
+	}
+
+	p := optsFor(t)
+	for _, tc := range []struct {
+		name    string
+		managed bool
+		want    bool
+	}{
+		{"managed winbind", true, true},
+		{"host-provided winbind", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			called = false
+			if err := provisionWith(modernWinbindConf(t), Options{ManagedWinbind: tc.managed}, p); err != nil {
+				t.Fatalf("provisionWith: %v", err)
+			}
+			if called != tc.want {
+				t.Errorf("prepareSambaState called = %v, want %v", called, tc.want)
+			}
+		})
 	}
 }
 

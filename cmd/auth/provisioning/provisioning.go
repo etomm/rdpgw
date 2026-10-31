@@ -24,12 +24,36 @@ const (
 	defaultKrb5Target = "/etc/krb5.conf"
 )
 
-// provisionOptions parameterizes the filesystem locations so the
-// provisioner can be exercised inside temporary directories by tests.
+// Options controls Provision. The zero value leaves Samba's runtime state
+// alone, which is the right choice when the host provides winbindd.
+type Options struct {
+	// ManagedWinbind means rdpgw-auth runs winbindd itself, so provisioning
+	// also prepares the Samba runtime directories and secrets.ldb that
+	// winbindd and "net ads join" expect. Leave it false when the host
+	// provides winbindd and owns that state.
+	ManagedWinbind bool
+}
+
+// provisionOptions parameterizes the filesystem locations so the provisioner
+// can be exercised inside temporary directories by tests. Empty values use
+// the packaged defaults.
 type provisionOptions struct {
 	StageDir   string
 	SmbTarget  string
 	Krb5Target string
+}
+
+func (p provisionOptions) withDefaults() provisionOptions {
+	if p.StageDir == "" {
+		p.StageDir = defaultStageDir
+	}
+	if p.SmbTarget == "" {
+		p.SmbTarget = defaultSmbTarget
+	}
+	if p.Krb5Target == "" {
+		p.Krb5Target = defaultKrb5Target
+	}
+	return p
 }
 
 // ErrExplosion marks provisioning failures that must abort startup because the
@@ -66,11 +90,17 @@ type krb5TemplateData struct {
 	DomainControllers []config.FlexibleDomainController
 }
 
-// Provision prepares the container's Samba and Kerberos configuration for
-// a winbind-backed deployment: it renders both templates into the staging
+// Provision prepares the container's Samba and Kerberos configuration for a
+// winbind-backed deployment: it renders both templates into the staging
 // directory and then reconciles the operator targets. Deployments without
 // any winbind capability (no Kerberos keytab share and no winbind NTLM
 // backend) skip provisioning entirely.
+//
+// When Options.ManagedWinbind is set, Provision also prepares the Samba
+// runtime directories and secrets.ldb that winbindd and "net ads join"
+// expect. With a host-provided winbindd the host owns that state, so only the
+// client-side smb.conf/krb5.conf used by pam_winbind, ntlm_auth and Kerberos
+// are reconciled.
 //
 // An operator-managed smb.conf that cannot receive the generated settings it
 // is missing (read-only volume, or a [global] section ending in a continuation
@@ -78,7 +108,12 @@ type krb5TemplateData struct {
 // half-configured against the domain (strict explode policy of the operations
 // plan, Milestone 2). Existing operator values are never replaced: drift
 // terminates the daemon with an error naming every conflicting setting.
-func Provision(conf config.Configuration) error {
+func Provision(conf config.Configuration, opts Options) error {
+	return provisionWith(conf, opts, provisionOptions{})
+}
+
+// provisionWith is Provision with injectable filesystem locations for tests.
+func provisionWith(conf config.Configuration, opts Options, p provisionOptions) error {
 	if !UsesWinbind(conf) {
 		log.Printf("Provisioning: no Kerberos keytab share and no winbind NTLM backend enabled, skipping smb.conf/krb5.conf provisioning")
 		return nil
@@ -91,11 +126,14 @@ func Provision(conf config.Configuration) error {
 	if err := conf.Validate(); err != nil {
 		return fmt.Errorf("provisioning: invalid configuration: %w", err)
 	}
-	return provision(conf, provisionOptions{
-		StageDir:   defaultStageDir,
-		SmbTarget:  defaultSmbTarget,
-		Krb5Target: defaultKrb5Target,
-	})
+	if err := provision(conf, p); err != nil {
+		return err
+	}
+	if !opts.ManagedWinbind {
+		log.Printf("Provisioning: winbindd is host-provided, leaving the Samba runtime state alone")
+		return nil
+	}
+	return prepareSambaState()
 }
 
 // UsesWinbind reports whether the deployment needs Samba/Kerberos files at
@@ -118,6 +156,7 @@ func UsesWinbind(conf config.Configuration) bool {
 }
 
 func provision(conf config.Configuration, p provisionOptions) error {
+	p = p.withDefaults()
 	if err := os.MkdirAll(p.StageDir, 0o700); err != nil {
 		return fmt.Errorf("provisioning: cannot create staging dir %s: %w", p.StageDir, err)
 	}

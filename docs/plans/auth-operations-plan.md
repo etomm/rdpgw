@@ -114,11 +114,18 @@ Go supervisor before the join logic moves.
 ---
 
 ## Milestone 6: Container Streamlining & Final Release (`rdpgw-auth`)
+### Status
+- Delivered on `feature/milestone-6-container`.
+- Verified locally: the image builds, the binary is PID 1 as root with the gRPC server as UID 1001, the generated PAM stack is installed, and a real gRPC `Authenticate` call with the `users` backend succeeds for the right password and is denied for a wrong one. SIGTERM produces a clean shutdown.
+- The container check also caught and fixed two PAM invocation bugs from Milestone 5: `pam_pwdfile` needs `pwdfile=<path>`, and the session manager must be invoked through `pam_exec.so`.
+- Remaining operator step: the K3s end-to-end check needs the image published (CI) and the cluster manifests updated; both live outside this repository.
+
 ### Scope
-- Update `Dockerfile.auth-winbind` to remove legacy shell scripts (`run-auth-winbind.sh`) and CLI dependencies (`yq-go`).
-- Rename binary and container image references to lightweight **`rdpgw-auth`**.
-- Update CI/CD build pipelines.
-- Verify end-to-end integration on the K3s cluster.
+- Absorb the last shell block: `cmd/auth/samba.go` creates the samba runtime directories, ownership (`private` root-only, `winbindd_privileged` for the group) and `secrets.ldb` before the join.
+- Remove `run-auth-winbind.sh`; the Dockerfile entrypoint is the binary itself (`rdpgw-auth --serve-user rdpgw`), which then provisions, joins, generates PAM and supervises winbindd.
+- Remove the now-unused `su-exec` and `yq-go` packages; add the PAM modules referenced by the generated stack (`pam-winbind`, `oath-toolkit-pam_oath`, `nss-pam-ldapd`, and `pam_pwdfile` built from source because Alpine does not package it).
+- Publish the image as **`rdpgw-auth`**, keeping `rdpgw-auth-winbind` as a compatibility alias in the CI tags.
+- Update CI/CD build pipelines and the Docker documentation.
 
 ### Deliverables
-- Streamlined `Dockerfile.auth-winbind` and updated Kubernetes manifests.
+- `cmd/auth/samba.go`, streamlined `Dockerfile.auth-winbind` (no shell entrypoint), updated `.github/workflows/docker-image.yml`, `dev/docker/docker-readme.md`.

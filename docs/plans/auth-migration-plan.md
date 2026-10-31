@@ -382,14 +382,14 @@ musl-based image (no NSS). See `docs/pam-authentication.md`.
 ## 7. Container Streamlining & Deployment (`rdpgw-auth`)
 
 ### 7.1 Dockerfile Changes (`dev/docker/Dockerfile.auth-winbind`)
-- Rename image / binary references to clean, lightweight **`rdpgw-auth`**.
-- Remove external shell script `run-auth-winbind.sh` and CLI utility `yq-go`.
-- Copy `session_manager.sh` to `/opt/rdpgw/session_manager.sh`.
-- Set container entrypoint directly to the compiled Go binary:
+- Image/binary references are **`rdpgw-auth`** (the registry keeps `rdpgw-auth-winbind` as an alias tag).
+- The external shell script `run-auth-winbind.sh` and CLI utilities `yq-go`/`su-exec` are gone; all startup work is in the binary.
+- PAM modules referenced by the generated stack are installed: `pam-winbind`, `oath-toolkit-pam_oath`, `nss-pam-ldapd`; `pam_pwdfile` is built from the pinned `tiwe-de/libpam-pwdfile` v1.0 tarball in the builder stage because Alpine does not package it.
+- `session_manager.sh` is copied to `/opt/rdpgw/session_manager.sh` and also rewritten by the daemon at startup:
   ```dockerfile
   COPY cmd/auth/pamstack/session_manager.sh /opt/rdpgw/session_manager.sh
   RUN chmod 0755 /opt/rdpgw/session_manager.sh
-  ENTRYPOINT ["/opt/rdpgw/rdpgw-auth"]
+  ENTRYPOINT ["/opt/rdpgw/rdpgw-auth", "--serve-user", "rdpgw"]
   ```
 
 ### 7.2 Verification Checklist

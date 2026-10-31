@@ -56,9 +56,10 @@ func main() {
 		os.Exit(serve.Run(context.Background(), serveOptions(), conf, nil))
 	}
 
-	// Stage and reconcile samba/kerberos files before any join or
+	// Stage and reconcile samba/kerberos files and, when rdpgw-auth runs
+	// winbindd itself, prepare its runtime state before any join or
 	// supervision happens. Without winbind capability this is a no-op.
-	if err := provisioning.Provision(conf); err != nil {
+	if err := provisioning.Provision(conf, provisioning.Options{ManagedWinbind: !supervisor.External()}); err != nil {
 		log.Fatalf("Provisioning failed: %v", err)
 	}
 

@@ -4,14 +4,23 @@
 # Unlike the other images in this directory, this one builds from the local
 # source tree. Build it from the repository root:
 #
-#   docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth-winbind .
+#   docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth .
 #
 # See dev/docker/docker-readme.md for how to run it.
 
 # builder stage
 FROM golang:1.25-alpine AS builder
 
-RUN apk --no-cache add gcc musl-dev linux-pam-dev
+RUN apk --no-cache add gcc musl-dev make curl tar linux-pam-dev
+
+# pam_pwdfile is not packaged by Alpine; build it against the same PAM
+# headers as the runtime image.
+RUN curl -fsSL https://github.com/tiwe-de/libpam-pwdfile/archive/refs/tags/v1.0.tar.gz \
+        -o /tmp/pam_pwdfile.tar.gz && \
+    mkdir -p /tmp/pam_pwdfile && \
+    tar -xzf /tmp/pam_pwdfile.tar.gz -C /tmp/pam_pwdfile --strip-components=1 && \
+    make -C /tmp/pam_pwdfile && \
+    cp /tmp/pam_pwdfile/pam_pwdfile.so /tmp/
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -24,25 +33,29 @@ FROM alpine:latest
 # samba-winbind provides winbindd, samba-winbind-clients provides
 # ntlm_auth and wbinfo, samba-common-tools provides net (for "net ads join"),
 # ldb-tools provides ldb tools for secrets.ldb initialization,
-# and krb5 is needed to join and talk to the domain.
+# krb5 is needed to join and talk to the domain, and the pam-* packages are
+# the modules referenced by the generated PAM stack.
 #
 # The samba/krb5 packages ship stock smb.conf and krb5.conf examples
 # (workgroup = MYGROUP, no default realm). rdpgw-auth provisions both files
 # itself, so remove the package samples instead of treating them as operator
 # configuration and reporting drift at startup.
 RUN apk --no-cache add linux-pam musl tzdata ca-certificates \
-        samba-winbind samba-winbind-clients samba-common-tools ldb-tools krb5 su-exec yq-go && \
+        samba-winbind samba-winbind-clients samba-common-tools ldb-tools krb5 \
+        pam-winbind oath-toolkit-pam_oath nss-pam-ldapd && \
     rm -f /etc/samba/smb.conf /etc/krb5.conf && \
     addgroup -S winbindd_priv && \
     adduser -D -H -h /opt/rdpgw -u 1001 rdpgw && \
     addgroup rdpgw winbindd_priv
 
 COPY --from=builder /opt/rdpgw/rdpgw-auth /opt/rdpgw/rdpgw-auth
+COPY --from=builder /tmp/pam_pwdfile.so /usr/lib/security/pam_pwdfile.so
 COPY dev/docker/rdpgw-pam /etc/pam.d/rdpgw
-COPY dev/docker/run-auth-winbind.sh /run-auth-winbind.sh
+COPY cmd/auth/pamstack/session_manager.sh /opt/rdpgw/session_manager.sh
+RUN chmod 0755 /opt/rdpgw/session_manager.sh
 
 WORKDIR /opt/rdpgw
-# The entrypoint and rdpgw-auth run as root: rdpgw-auth supervises the
-# winbindd child, which needs root for the samba private/privileged dirs.
-# The gRPC socket stays UID-gated by --allow-uid/--allow-gid.
-ENTRYPOINT ["/bin/sh", "/run-auth-winbind.sh"]
+# The daemon runs as root in this image: it prepares the samba runtime
+# directories, joins the domain and supervises winbindd (root-owned samba
+# state), then re-executes the gRPC server as the unprivileged rdpgw user.
+ENTRYPOINT ["/opt/rdpgw/rdpgw-auth", "--serve-user", "rdpgw"]
