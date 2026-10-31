@@ -1,3 +1,8 @@
-# basic PAM configuration for rdpgw on Alpine
-auth include base-auth
-auth include base-account
+# Fallback PAM stack for rdpgw-auth.
+#
+# AuthProtocols.Basic generates and overwrites this file at startup with the
+# configured backend stack. When Basic is disabled (NTLM/Kerberos-only
+# deployments) this file must still be valid, so deny explicitly instead of
+# including distribution files that the minimal image does not ship.
+auth required pam_deny.so
+account required pam_deny.so

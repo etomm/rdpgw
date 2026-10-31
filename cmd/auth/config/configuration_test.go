@@ -67,6 +67,8 @@ func TestLoadLegacyWinbind(t *testing.T) {
 	dir := t.TempDir()
 	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
 	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  Domain: corp.example.com
 Ntlm:
   Backend: winbind
   Winbind:
@@ -85,6 +87,7 @@ Ntlm:
 	}
 	want := Configuration{
 		Winbind: &WinbindConfig{
+			Domain:              "corp.example.com",
 			NtlmAuthPath:        helper,
 			Workgroup:           "EXAMPLE",
 			RequireMembershipOf: `EXAMPLE\RDP Users`,
@@ -280,11 +283,12 @@ func TestLoadLegacySeparatorCarryOver(t *testing.T) {
 	dir := t.TempDir()
 	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
 	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  Domain: corp.example.com
 Ntlm:
   Backend: winbind
   Winbind:
     NtlmAuthPath: `+helper+`
-    Domain: EXAMPLE
     Separator: "+"
 `)
 	c, err := load(p)
@@ -303,11 +307,12 @@ func TestLoadLegacyLongSeparatorTakesFirstChar(t *testing.T) {
 	dir := t.TempDir()
 	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
 	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  Domain: corp.example.com
 Ntlm:
   Backend: winbind
   Winbind:
     NtlmAuthPath: `+helper+`
-    Domain: EXAMPLE
     Separator: "++"
 `)
 	c, err := load(p)
@@ -356,6 +361,74 @@ AuthProtocols:
 	}
 }
 
+func TestLoadCanonicalCamelCaseKeys(t *testing.T) {
+	// The documentation uses the canonical field names (Domain, KeytabPath,
+	// Backends, ...). sigs.k8s.io/yaml decodes through encoding/json, which
+	// matches struct tags case-insensitively; this keeps the docs valid.
+	dir := t.TempDir()
+	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
+	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  Domain: example.com
+  NtlmAuthPath: `+helper+`
+  Timeout: 1
+  AutoJoin: true
+AuthProtocols:
+  Kerberos:
+    Share: true
+    KeytabPath: /var/lib/samba/rdpgw.keytab
+    Spns:
+      - HTTP/rdpgw.example.com
+  Ntlm:
+    Enabled: true
+    Backends:
+      - users
+Users:
+  - Username: alice
+    Password: secret
+`)
+	c, err := load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Winbind.Domain != "example.com" || c.Winbind.Workgroup != "EXAMPLE" || !c.Winbind.AutoJoin {
+		t.Errorf("Winbind = %+v", c.Winbind)
+	}
+	if !c.AuthProtocols.Kerberos.Share || c.AuthProtocols.Kerberos.KeytabPath != "/var/lib/samba/rdpgw.keytab" {
+		t.Errorf("Kerberos = %+v", c.AuthProtocols.Kerberos)
+	}
+	if len(c.AuthProtocols.Ntlm.Backends) != 1 || c.AuthProtocols.Ntlm.Backends[0] != NtlmBackendUsers {
+		t.Errorf("Ntlm = %+v", c.AuthProtocols.Ntlm)
+	}
+}
+
+func TestLoadDefaultsSharedKeytabPath(t *testing.T) {
+	// The keytab path has a documented default. Enabling the share without
+	// specifying it must use DefaultSharedKeytab instead of failing
+	// validation or rendering an empty smb.conf directive.
+	dir := t.TempDir()
+	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
+	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  NtlmAuthPath: `+helper+`
+  Domain: corp.example.com
+AuthProtocols:
+  Kerberos:
+    Share: true
+  Ntlm:
+    Enabled: true
+    Backends:
+      - winbind
+`)
+	c, err := load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.AuthProtocols.Kerberos.KeytabPath != DefaultSharedKeytab {
+		t.Errorf("KeytabPath = %q, want %q", c.AuthProtocols.Kerberos.KeytabPath, DefaultSharedKeytab)
+	}
+}
+
 func TestLoadModernKerberosSpns(t *testing.T) {
 	// SPNs belong to the Kerberos block: without a keytab share there is
 	// nothing to register. The modern schema must accept them there.
@@ -393,6 +466,184 @@ AuthProtocols:
 	}
 }
 
+func TestLoadModernBasicStack(t *testing.T) {
+	dir := t.TempDir()
+	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
+	p := writeFile(t, dir, "rdpgw-auth.yaml", `
+Winbind:
+  NtlmAuthPath: `+helper+`
+  Timeout: 5
+  Domain: example.com
+Users:
+  - Username: alice
+    Password: secret
+Ldap:
+  - Name: corp
+    Host: ldap.example.com
+    Port: 636
+    TLS: true
+    Base: dc=example,dc=com
+Oath:
+  - Name: totp
+    UsersFile: /etc/users.oath
+    Window: 30
+AuthProtocols:
+  Basic:
+    Enabled: true
+    Stack:
+      - Backend: winbind
+        Oath: totp
+      - Backend: ldap
+        Name: corp
+      - Backend: users
+`)
+	c, err := load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	basic := c.AuthProtocols.Basic
+	if basic == nil || !basic.Enabled {
+		t.Fatalf("Basic protocol not loaded: %+v", c.AuthProtocols)
+	}
+	if len(basic.Stack) != 3 {
+		t.Fatalf("stack = %+v, want 3 entries", basic.Stack)
+	}
+	if basic.Stack[0].Backend != BasicBackendWinbind || basic.Stack[0].Oath != "totp" {
+		t.Errorf("first stack entry = %+v", basic.Stack[0])
+	}
+	if basic.Stack[1].Name != "corp" {
+		t.Errorf("ldap entry = %+v", basic.Stack[1])
+	}
+	if len(c.Oath) != 1 || c.Oath["totp"].UsersFile != "/etc/users.oath" || c.Oath["totp"].Window != 30 {
+		t.Errorf("oath profiles = %+v", c.Oath)
+	}
+	if len(c.Ldap) != 1 || c.Ldap["corp"].Host != "ldap.example.com" || !c.Ldap["corp"].TLS {
+		t.Errorf("ldap profiles = %+v", c.Ldap)
+	}
+}
+
+func TestValidateBasicStack(t *testing.T) {
+	dir := t.TempDir()
+	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
+	valid := func() Configuration {
+		return Configuration{
+			Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1, Domain: "example.com", Workgroup: "EXAMPLE"},
+			Users:   []UserConfig{{Username: "alice", Password: "secret"}},
+			Ldap:    LdapProfiles{"corp": {Name: "corp", Host: "ldap.example.com"}},
+			Oath:    OathProfiles{"totp": {Name: "totp", UsersFile: "/etc/users.oath"}},
+			AuthProtocols: &AuthProtocolsConfig{
+				Basic: &BasicProtocolConfig{
+					Enabled: true,
+					Stack: []BasicStackEntry{
+						{Backend: BasicBackendWinbind, Oath: "totp"},
+						{Backend: BasicBackendLdap, Name: "corp"},
+						{Backend: BasicBackendUsers},
+					},
+				},
+			},
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Configuration)
+		want   string
+	}{
+		{"valid", func(*Configuration) {}, ""},
+		{"unknown backend", func(c *Configuration) { c.AuthProtocols.Basic.Stack[0].Backend = "pam" }, "unknown AuthProtocols.Basic.Stack backend"},
+		{"missing ldap profile", func(c *Configuration) { c.AuthProtocols.Basic.Stack[1].Name = "nope" }, "unknown Ldap"},
+		{"missing oath profile", func(c *Configuration) { c.AuthProtocols.Basic.Stack[0].Oath = "nope" }, "unknown Oath"},
+		{"users backend without users", func(c *Configuration) { c.Users = nil }, "Users is empty"},
+		{"duplicate backend", func(c *Configuration) {
+			c.AuthProtocols.Basic.Stack = []BasicStackEntry{{Backend: BasicBackendUnix}, {Backend: BasicBackendUnix}}
+		}, "duplicate AuthProtocols.Basic.Stack entry"},
+		{"winbind without config", func(c *Configuration) { c.Winbind = nil }, "Winbind must be configured"},
+		{"empty stack", func(c *Configuration) { c.AuthProtocols.Basic.Stack = nil }, "Stack must not be empty"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := valid()
+			tc.mutate(&c)
+			err := c.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestValidateBasicOnlyStackNeedsNoWinbind(t *testing.T) {
+	c := Configuration{
+		AuthProtocols: &AuthProtocolsConfig{
+			Basic: &BasicProtocolConfig{
+				Enabled: true,
+				Stack:   []BasicStackEntry{{Backend: BasicBackendUnix}},
+			},
+		},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Basic-only unix stack must validate without Winbind: %v", err)
+	}
+}
+
+func TestValidateProfiles(t *testing.T) {
+	base := func() Configuration {
+		return Configuration{
+			Ldap: LdapProfiles{"corp": {Name: "corp", Host: "ldap.example.com"}},
+			Oath: OathProfiles{"totp": {Name: "totp", UsersFile: "/etc/users.oath"}},
+			AuthProtocols: &AuthProtocolsConfig{
+				Basic: &BasicProtocolConfig{
+					Enabled: true,
+					Stack:   []BasicStackEntry{{Backend: BasicBackendUnix}},
+				},
+			},
+		}
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*Configuration)
+		want   string
+	}{
+		{"valid", func(*Configuration) {}, ""},
+		{"ldap name", func(c *Configuration) {
+			c.Ldap = LdapProfiles{"": {Host: "ldap.example.com"}}
+		}, "Ldap.Name must be set"},
+		{"ldap host", func(c *Configuration) {
+			profile := c.Ldap["corp"]
+			profile.Host = ""
+			c.Ldap["corp"] = profile
+		}, "Host must be set"},
+		{"oath name", func(c *Configuration) {
+			c.Oath = OathProfiles{"": {UsersFile: "/etc/users.oath"}}
+		}, "Oath.Name must be set"},
+		{"oath usersfile", func(c *Configuration) {
+			profile := c.Oath["totp"]
+			profile.UsersFile = ""
+			c.Oath["totp"] = profile
+		}, "UsersFile must be set"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := base()
+			tc.mutate(&c)
+			err := c.Validate()
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("Validate: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Validate = %v, want error containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
 func TestValidate(t *testing.T) {
 	helper := writeFile(t, t.TempDir(), "ntlm_auth", "#!/bin/sh\n")
 	nonExistentHelper := filepath.Join(t.TempDir(), "non", "existent", "ntlm_auth")
@@ -406,11 +657,12 @@ func TestValidate(t *testing.T) {
 		{"unknown backend", Configuration{AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{"ldap"}}}}, "unknown AuthProtocols.Ntlm.Backends"},
 		{"empty backend", Configuration{AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true}}}, "unknown AuthProtocols.Ntlm.Backends"},
 		{"missing NtlmAuthPath path, but no winbind", Configuration{Winbind: &WinbindConfig{Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendUsers}}}}, ""},
-		{"missing NtlmAuthPath path", Configuration{Winbind: &WinbindConfig{Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "NtlmAuthPath must be set"},
-		{"nonexistent path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: nonExistentHelper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "is not usable"},
-		{"zero timeout", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 0}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "Timeout must be positive"},
-		{"missing keytab path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true}}}, "Kerberos.KeytabPath must be set"},
-		{"missing shared krb5 path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true, KeytabPath: DefaultSharedKeytab}}}, "Kerberos.Krb5ConfPath must be set"},
+		{"missing domain and workgroup", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "Winbind.Domain"},
+		{"missing NtlmAuthPath path", Configuration{Winbind: &WinbindConfig{Domain: "example.com", Workgroup: "EXAMPLE", Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "NtlmAuthPath must be set"},
+		{"nonexistent path", Configuration{Winbind: &WinbindConfig{Domain: "example.com", Workgroup: "EXAMPLE", NtlmAuthPath: nonExistentHelper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "is not usable"},
+		{"zero timeout", Configuration{Winbind: &WinbindConfig{Domain: "example.com", Workgroup: "EXAMPLE", NtlmAuthPath: helper, Timeout: 0}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "Timeout must be positive"},
+		{"missing keytab path", Configuration{Winbind: &WinbindConfig{Domain: "example.com", Workgroup: "EXAMPLE", NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true}}}, "Kerberos.KeytabPath must be set"},
+		{"missing shared krb5 path", Configuration{Winbind: &WinbindConfig{Domain: "example.com", Workgroup: "EXAMPLE", NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true, KeytabPath: DefaultSharedKeytab}}}, "Kerberos.Krb5ConfPath must be set"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

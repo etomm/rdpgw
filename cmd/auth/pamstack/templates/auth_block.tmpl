@@ -1,0 +1,6 @@
+{{- /* One auth block of the generated PAM stack. A backend that does not match jumps over the rest of its block: 2 remaining lines with OATH (auth module + create), 1 without (create). The create line fails closed: if the session record cannot be written, the account phase cannot be trusted, so authentication stops here. */ -}}
+{{- if .Oath -}}
+auth [success=ok default=2] {{ .Oath }}
+{{ end -}}
+auth [success=ok default=1] {{ .Module }}
+auth [success=done default=die] pam_exec.so {{ .SessionManager }} create {{ .Key }}

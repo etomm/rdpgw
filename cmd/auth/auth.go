@@ -11,6 +11,7 @@ import (
 
 	"github.com/bolkedebruin/rdpgw/cmd/auth/config"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/join"
+	"github.com/bolkedebruin/rdpgw/cmd/auth/pamstack"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/provisioning"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/serve"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/supervisor"
@@ -59,6 +60,11 @@ func main() {
 	// supervision happens. Without winbind capability this is a no-op.
 	if err := provisioning.Provision(conf); err != nil {
 		log.Fatalf("Provisioning failed: %v", err)
+	}
+
+	// Generate the PAM stack for the Basic protocol (no-op when disabled).
+	if err := pamstack.Install(conf, pamstack.DefaultPaths(opts.ServiceName), opts.ServeUser); err != nil {
+		log.Fatalf("PAM provisioning failed: %v", err)
 	}
 
 	// SIGTERM/SIGINT must reach the shutdown path: it stops winbindd and

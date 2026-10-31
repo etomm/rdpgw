@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"os"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/mitchellh/copystructure"
@@ -23,6 +25,17 @@ const (
 	NtlmBackendWinbind = "winbind"
 	// NtlmBackendUsers verifies NTLM responses against local YAML users.
 	NtlmBackendUsers = "users"
+
+	// Backends accepted by AuthProtocols.Basic.Stack.
+	BasicBackendWinbind = "winbind"
+	BasicBackendLdap    = "ldap"
+	BasicBackendUnix    = "unix"
+	BasicBackendUsers   = "users"
+
+	// BasicPluginOath names the Oath section/profile namespace. Like the
+	// backend types it is reserved, so a bare Basic.Stack string is never
+	// ambiguous.
+	BasicPluginOath = "oath"
 
 	// Default configuration constants
 	DefaultNtlmAuthPath   = "/usr/bin/ntlm_auth"
@@ -64,8 +77,58 @@ var DefaultConfig = &Configuration{
 // Configuration holds the modern (new schema) rdpgw-auth configuration.
 type Configuration struct {
 	Winbind       *WinbindConfig       `json:"winbind" yaml:"winbind"`
+	Ldap          LdapProfiles         `json:"ldap" yaml:"ldap"`
 	Users         []UserConfig         `json:"users" yaml:"users"`
+	Oath          OathProfiles         `json:"oath" yaml:"oath"`
 	AuthProtocols *AuthProtocolsConfig `json:"authprotocols" yaml:"authprotocols"`
+}
+
+// LdapConfig names a directory used by the Basic (PAM) stack. pam_ldap reads
+// its connection settings from the system LDAP configuration; the profile
+// name is what AuthProtocols.Basic.Stack references.
+type LdapConfig struct {
+	// Name is the profile name, set from the list form's name or from the
+	// mapping key.
+	Name   string `json:"name" yaml:"name"`
+	Host   string `json:"host" yaml:"host"`
+	Port   int    `json:"port" yaml:"port"`
+	TLS    bool   `json:"tls" yaml:"tls"`
+	Base   string `json:"base" yaml:"base"`
+	BindDN string `json:"binddn" yaml:"binddn"`
+	BindPW string `json:"bindpw" yaml:"bindpw"`
+}
+
+// OathConfig names a PAM OATH policy (TOTP/HOTP) and its user file.
+type OathConfig struct {
+	// Name is the profile name, set from the list form's name or from the
+	// mapping key.
+	Name      string `json:"name" yaml:"name"`
+	UsersFile string `json:"usersfile" yaml:"usersfile"`
+	Window    int    `json:"window" yaml:"window"`
+}
+
+// LdapProfiles maps the lowercased Ldap profile name to its configuration.
+type LdapProfiles = Profiles[LdapConfig]
+
+// OathProfiles maps the lowercased Oath profile name to its configuration.
+type OathProfiles = Profiles[OathConfig]
+
+// ProfileName implements NamedProfile.
+func (c LdapConfig) ProfileName() string { return c.Name }
+
+// WithProfileName implements NamedProfile.
+func (c LdapConfig) WithProfileName(name string) LdapConfig {
+	c.Name = name
+	return c
+}
+
+// ProfileName implements NamedProfile.
+func (o OathConfig) ProfileName() string { return o.Name }
+
+// WithProfileName implements NamedProfile.
+func (o OathConfig) WithProfileName(name string) OathConfig {
+	o.Name = name
+	return o
 }
 
 type UserConfig struct {
@@ -104,6 +167,14 @@ type WinbindConfig struct {
 type AuthProtocolsConfig struct {
 	Kerberos *KerberosProtocolConfig `json:"kerberos" yaml:"kerberos"`
 	Ntlm     *NtlmProtocolConfig     `json:"ntlm" yaml:"ntlm"`
+	Basic    *BasicProtocolConfig    `json:"basic" yaml:"basic"`
+}
+
+// BasicProtocolConfig drives the generated PAM stack. Backends are tried in
+// the configured order; each entry may attach an OATH policy.
+type BasicProtocolConfig struct {
+	Enabled bool              `json:"enabled" yaml:"enabled"`
+	Stack   []BasicStackEntry `json:"stack" yaml:"stack"`
 }
 
 type KerberosProtocolConfig struct {
@@ -166,8 +237,8 @@ type LegacyWinbindConfig struct {
 
 var Conf Configuration
 
-// Load reads the rdpgw-auth configuration file, applies defaults and
-// validates the result. Invalid configuration is fatal.
+// Load reads the rdpgw-auth configuration file, applies defaults, normalizes
+// shorthand entries and validates the result. Invalid configuration is fatal.
 func Load(configFile string) Configuration {
 	c, err := load(configFile)
 	if err != nil {
@@ -287,10 +358,37 @@ func load(configFile string) (Configuration, error) {
 		}
 	}
 
+	// Resolve the Basic.Stack shorthand: a bare Ldap profile name becomes the
+	// ldap backend (and entries are trimmed/case-normalized). Everything else
+	// is left for Validate, which reports missing or invalid entries.
+	if c.AuthProtocols != nil && c.AuthProtocols.Basic != nil && c.AuthProtocols.Basic.Enabled {
+		basic := c.AuthProtocols.Basic
+		for i, entry := range basic.Stack {
+			entry.Backend = strings.ToLower(strings.TrimSpace(entry.Backend))
+			entry.Name = strings.TrimSpace(entry.Name)
+			entry.Oath = strings.TrimSpace(entry.Oath)
+			if entry.Backend == "" && entry.Name != "" {
+				name := strings.ToLower(entry.Name)
+				switch name {
+				case BasicBackendWinbind, BasicBackendLdap, BasicBackendUnix, BasicBackendUsers:
+					// A bare reserved name is the backend. Bare "ldap" has no
+					// profile name; Validate reports the missing profile.
+					entry.Backend = name
+					entry.Name = ""
+				default:
+					if _, ok := c.Ldap[name]; ok {
+						entry.Backend = BasicBackendLdap
+					}
+				}
+			}
+			basic.Stack[i] = entry
+		}
+	}
+
 	return c, c.Validate()
 }
 
-// Validate checks the NTLM backend settings.
+// Validate checks the authentication protocol settings.
 func (c *Configuration) Validate() error {
 	authProtocols := c.AuthProtocols
 	if authProtocols == nil {
@@ -300,8 +398,10 @@ func (c *Configuration) Validate() error {
 	hasKerberos := kerberos != nil && kerberos.Share
 	ntlm := authProtocols.Ntlm
 	hasNtlm := ntlm != nil && ntlm.Enabled
+	basic := authProtocols.Basic
+	hasBasic := basic != nil && basic.Enabled
 
-	if !hasKerberos && !hasNtlm {
+	if !hasKerberos && !hasNtlm && !hasBasic {
 		return errors.New("unknown AuthProtocols")
 	}
 
@@ -336,14 +436,99 @@ func (c *Configuration) Validate() error {
 		hasNtlmWithWinbindBackend = lo.Contains(distinctBackends, ntlmBackendWinbindLower)
 	}
 
-	if !hasKerberos && !hasNtlmWithWinbindBackend {
-		// If neither Kerberos nor NTLM with Winbind backend is enabled, it means Ntlm is configured with only the Users backend. No Winbind configuration is needed.
+	basicUsesWinbind := false
+	if hasBasic {
+		if err := validateProfiles(c); err != nil {
+			return err
+		}
+		if len(basic.Stack) == 0 {
+			return errors.New("AuthProtocols.Basic.Stack must not be empty")
+		}
+		seen := make(map[[3]string]bool, len(basic.Stack))
+		for i, entry := range basic.Stack {
+			backend := strings.ToLower(strings.TrimSpace(entry.Backend))
+			name := strings.TrimSpace(entry.Name)
+			oath := strings.TrimSpace(entry.Oath)
+
+			if backend == "" {
+				if name == "" {
+					return fmt.Errorf("AuthProtocols.Basic.Stack[%d] is missing a backend or Ldap profile name", i)
+				}
+				return fmt.Errorf("AuthProtocols.Basic.Stack[%d] references unknown Ldap profile %q", i, name)
+			}
+
+			key := [3]string{backend, name, oath}
+			switch backend {
+			case BasicBackendWinbind:
+				basicUsesWinbind = true
+			case BasicBackendLdap:
+				if name == "" {
+					return fmt.Errorf("AuthProtocols.Basic.Stack[%d] ldap backend needs a profile name", i)
+				}
+				if _, ok := c.Ldap[strings.ToLower(name)]; !ok {
+					return fmt.Errorf("AuthProtocols.Basic.Stack[%d] references unknown Ldap %q", i, name)
+				}
+			case BasicBackendUnix:
+				// Local system accounts, no profile.
+			case BasicBackendUsers:
+				if len(c.Users) == 0 {
+					return errors.New("AuthProtocols.Basic.Stack uses the users backend but Users is empty")
+				}
+				for _, user := range c.Users {
+					if user.Username == "" || user.Password == "" {
+						return errors.New("Users entries need a username and password for the Basic stack")
+					}
+				}
+			default:
+				return fmt.Errorf("unknown AuthProtocols.Basic.Stack backend %q", entry.Backend)
+			}
+			if backend != BasicBackendLdap && name != "" {
+				return fmt.Errorf("AuthProtocols.Basic.Stack[%d] %s backend does not take a profile name", i, backend)
+			}
+			if oath != "" {
+				if _, ok := c.Oath[strings.ToLower(oath)]; !ok {
+					return fmt.Errorf("AuthProtocols.Basic.Stack[%d] references unknown Oath %q", i, oath)
+				}
+			}
+			if seen[key] {
+				parts := []string{backend}
+				if name != "" {
+					parts = append(parts, name)
+				}
+				if oath != "" {
+					parts = append(parts, oath)
+				}
+				return fmt.Errorf("duplicate AuthProtocols.Basic.Stack entry %s", strings.Join(parts, "+"))
+			}
+			seen[key] = true
+		}
+	}
+
+	if !hasKerberos && !hasNtlmWithWinbindBackend && !basicUsesWinbind {
+		// NTLM/Basic with only local verifiers: no Winbind configuration is needed.
 		return nil
 	}
 
 	winbind := c.Winbind
-	if (hasKerberos || hasNtlmWithWinbindBackend) && winbind == nil {
-		return errors.New("Winbind must be configured when AuthProtocols Kerberos or NTLM with Winbind backend are enabled")
+	if winbind == nil {
+		return errors.New("Winbind must be configured when AuthProtocols Kerberos, NTLM or Basic use the winbind backend")
+	}
+
+	// The generated smb.conf 'realm' and krb5.conf 'default_realm' are the
+	// Kerberos/DNS realm, not the NetBIOS workgroup. A NetBIOS name is not a
+	// valid substitute, so Domain is mandatory. config.Load derives
+	// Workgroup from Domain when it is omitted.
+	if winbind.Domain == "" {
+		return errors.New("Winbind.Domain (the DNS realm/FQDN, e.g. corp.example.com) must be set when a winbind backend is enabled")
+	}
+	if winbind.Workgroup == "" {
+		return errors.New("Winbind.Workgroup must be set (config.Load derives it from Winbind.Domain)")
+	}
+
+	for i, dc := range winbind.DomainControllers {
+		if strings.TrimSpace(dc.Host) == "" {
+			return fmt.Errorf("Winbind.DomainControllers[%d].Host must be set", i)
+		}
 	}
 
 	if winbind.NtlmAuthPath == "" {
@@ -356,6 +541,59 @@ func (c *Configuration) Validate() error {
 
 	if winbind.Timeout <= 0 {
 		return errors.New("Winbind.Timeout must be positive")
+	}
+	return nil
+}
+
+// validProfileName reports whether a profile name only uses letters, digits,
+// '.', '_' and '-'.
+func validProfileName(name string) bool {
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateProfiles checks the named LDAP and OATH profiles referenced by the
+// Basic stack. Profiles are keyed by name, so uniqueness is structural; keys
+// are visited in sorted order to keep the first reported error deterministic.
+func validateProfiles(c *Configuration) error {
+	for _, name := range slices.Sorted(maps.Keys(c.Ldap)) {
+		profile := c.Ldap[name]
+		if name == "" {
+			return errors.New("Ldap.Name must be set")
+		}
+		if !validProfileName(name) {
+			return fmt.Errorf("Ldap name %q may only contain letters, digits, '.', '_' and '-'", name)
+		}
+		switch strings.ToLower(name) {
+		case BasicBackendWinbind, BasicBackendLdap, BasicBackendUnix, BasicBackendUsers, BasicPluginOath:
+			return fmt.Errorf("Ldap name %q is reserved for a Basic stack backend type", name)
+		}
+		if profile.Host == "" {
+			return fmt.Errorf("Ldap %q Host must be set", name)
+		}
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(c.Oath)) {
+		profile := c.Oath[name]
+		if name == "" {
+			return errors.New("Oath.Name must be set")
+		}
+		if !validProfileName(name) {
+			return fmt.Errorf("Oath name %q may only contain letters, digits, '.', '_' and '-'", name)
+		}
+		switch strings.ToLower(name) {
+		case BasicBackendWinbind, BasicBackendLdap, BasicBackendUnix, BasicBackendUsers, BasicPluginOath:
+			return fmt.Errorf("Oath name %q is reserved for a Basic stack backend type", name)
+		}
+		if profile.UsersFile == "" {
+			return fmt.Errorf("Oath %q UsersFile must be set", name)
+		}
 	}
 	return nil
 }

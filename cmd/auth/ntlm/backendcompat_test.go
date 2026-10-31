@@ -89,6 +89,7 @@ func TestCompatOrderedModernConfigFromYAML(t *testing.T) {
 	yamlBody := `
 winbind:
   ntlmauthpath: ` + helper + `
+  domain: corp.local
   workgroup: CORP
   requiremembershipof: "CORP\\RDP Users"
   timeout: 7
@@ -167,6 +168,7 @@ func TestCompatWinbindOnlyConfigReturnsBackendDirectly(t *testing.T) {
 	p := writeCompatConfig(t, `
 winbind:
   ntlmauthpath: `+helper+`
+  domain: corp.local
   workgroup: CORP
 authprotocols:
   ntlm:
@@ -191,6 +193,7 @@ func TestCompatDisabledNtlmIsDenied(t *testing.T) {
 	}
 	p := writeCompatConfig(t, `
 winbind:
+  domain: corp.local
   ntlmauthpath: `+helper+`
 authprotocols:
   kerberos:
@@ -219,6 +222,7 @@ func TestCompatKerberosOnlyIsDenied(t *testing.T) {
 	}
 	p := writeCompatConfig(t, `
 winbind:
+  domain: corp.local
   ntlmauthpath: `+helper+`
 authprotocols:
   kerberos:

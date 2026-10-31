@@ -79,6 +79,7 @@ Go supervisor before the join logic moves.
 ### Status
 - Implementation landed with the configuration work (`b5cb193`): `cmd/auth/ntlm/orderedbackend.go`, `nullbackend.go` and `newNtlmBackend` in `cmd/auth/auth.go`.
 - Verified on `feature/milestone-4-ntlm-backends`; coverage lives in `orderedbackend_test.go` and `backendcompat_test.go`.
+- The baked fallback `/etc/pam.d/rdpgw` was made self-contained (`pam_deny`): Alpine does not ship the `base-auth`/`base-account` includes the old file referenced.
 
 ### Scope
 - Implement `AuthProtocols.Ntlm` parsing and execution.
@@ -90,14 +91,25 @@ Go supervisor before the join logic moves.
 ---
 
 ## Milestone 5: Modular PAM Stack Generation & Static Users (`users.pwd`)
+### Status
+- Delivered on `feature/milestone-5-pam-stack`.
+
 ### Scope
 - Implement static YAML users to `pam_pwdfile` integration (`users.pwd` generation under `/tmp/rdpgw/`).
 - Deploy `session_manager.sh` alongside `rdpgw-auth` at `/opt/rdpgw/session_manager.sh`.
-- Build the dynamic PAM stack generator by fusing ready smaller template blocks (Winbind, LDAP, Unix, Users + OATH) into one unified `/etc/pam.d/rdpgw` file using robust `success=ok default=...` skip logic.
+- Build the dynamic PAM stack generator by fusing ready smaller template blocks (Winbind, LDAP, Unix, Users + OATH) into one unified `/etc/pam.d/rdpgw` file using robust `success=ok default=...` skip logic. A top-level `pam_stack.tmpl` composes the per-backend blocks (it invokes `auth_block.tmpl` and `account_block.tmpl`) instead of concatenating rendered strings in Go.
+- Configuration schema: `Ldap` and `Oath` profiles plus `AuthProtocols.Basic` (`enabled`, ordered `stack` of `backend`/`name`/`oath`), validated against the referenced profiles.
+- `users.pwd` stores SHA-512 crypt (`$6$`) hashes with a fresh random salt per start; the file is mode 0600.
+- LDAP profiles render a per-profile `pam_ldap` client config under `/tmp/rdpgw/` (host/port/base/binddn/bindpw/TLS), mode 0600.
+- Auth phase: each block is `[success=ok default=N]` so a failed OATH/module jumps over the rest of its block; the successful module records the backend via `session_manager.sh create`.
+- The daemon injects `RDPGW_SESSION_ID` (a fresh GUID per authentication attempt) into the PAM environment before `pam_authenticate`; `session_manager.sh` keys its state only on that id (no username fallback), so concurrent logins for the same user cannot overwrite each other and a missing id fails closed.
+- Failure semantics: `create` uses `success=done default=die`, so authentication cannot proceed if the backend record cannot be written; a failed `check` skips its block and the final `pam_deny` fails the account phase; `cleanup` is best effort (`default=done`) because the account module already decided.
+- Account phase: `check` must match the recorded backend; only then does that backend's account module run, with `cleanup` terminating the stack. A final `pam_deny` covers the no-match case.
 
 ### Deliverables
-- PAM template fragment definitions and dynamic fusion engine.
-- Session manager script deployment.
+- `cmd/auth/pamstack/` (fusion engine, `templates/` fragments, `session_manager.sh`, and the PAM `Session`/`StartSession` helper that injects `RDPGW_SESSION_ID`).
+- `AuthProtocols.Basic`/`Ldap`/`Oath` schema and validation in `cmd/auth/config/configuration.go`.
+- Wiring in `cmd/auth/auth.go`.
 
 ---
 

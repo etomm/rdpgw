@@ -18,9 +18,9 @@ Winbind:
   spns:
     - "HTTP/rdpgw.corp.example.com"
 
-# 2. LDAP Directories (Multiple allowed)
+# 2. LDAP Directories (keyed by profile name)
 Ldap:
-  - name: "corp-ldap"
+  corp-ldap:
     host: "ldap.example.com"
     port: 636
     tls: true
@@ -33,12 +33,12 @@ Users:
   - Username: "alice"
     Password: "secure_password_1"
 
-# 4. Multiple Named OATH Policies (TOTP/HOTP)
+# 4. Named OATH Policies (TOTP/HOTP, keyed by profile name)
 Oath:
-  - name: "default-totp"
+  default-totp:
     usersfile: "/etc/users.oath"
     window: 30
-  - name: "strict-yubikey"
+  strict-yubikey:
     usersfile: "/etc/yubikey.oath"
 
 # 5. Protocol Frontends & Authentication Pipelines
@@ -66,6 +66,43 @@ AuthProtocols:
       - backend: "users"                # Local YAML static users
         oath: "default-totp"
 ```
+
+Both `Ldap` and `Oath` accept either the mapping form shown above or a list of
+entries with a `name:` field. The two are equivalent, and duplicate names are
+rejected in both forms:
+
+```yaml
+Ldap:
+  - name: corp-ldap
+    host: ldap.example.com
+```
+
+Stack entries can be written as bare strings when they need no `oath` policy.
+A bare string that matches an `Ldap` profile resolves to
+`{backend: ldap, name: <profile>}`; the reserved backend names `winbind`,
+`unix` and `users` resolve to that backend. `ldap` cannot be bare because it
+needs a profile name.
+
+```yaml
+  Basic:
+    enabled: true
+    stack:
+      - winbind
+      - corp-ldap        # same as {backend: ldap, name: corp-ldap}
+      - users
+```
+
+Use the object form to attach an OATH policy:
+
+```yaml
+      - backend: users
+        oath: default-totp
+```
+
+For that reason `Ldap` and `Oath` profile names cannot be `winbind`, `ldap`,
+`unix`, `users` or `oath`. Profile names may only contain letters, digits,
+`.`, `_` and `-`. They are case-insensitive: `Corp` and `corp` are the same
+profile.
 
 ## Kerberos keytab sharing
 

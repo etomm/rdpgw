@@ -260,7 +260,7 @@ Using Go `embed` (`//go:embed`):
        .{{ .DomainLower }} = {{ .Realm }}
        {{ .DomainLower }} = {{ .Realm }}
    ```
-3. **`pam.tmpl`**: Dynamic template rendering the stateful `pam_exec` stack using intelligent `success=ok default=...` skip logic.
+3. **`pam.tmpl`**: implemented as the per-block fragments in `cmd/auth/pamstack/templates/` (`auth_block.tmpl`, `account_block.tmpl`), fused by `cmd/auth/pamstack/pamstack.go` with the stateful `pam_exec` skip logic.
 
 ### 4.4 Static YAML Users to PAM Integration (`users` backend)
 For the `users` backend (static YAML credentials) to work within the PAM `Basic` stack, the Go initializer performs the following:
@@ -268,7 +268,7 @@ For the `users` backend (static YAML credentials) to work within the PAM `Basic`
 - **Formatting**: It generates a standard `pam_pwdfile` compatible file at `/tmp/rdpgw/users.pwd` in the format `username:encrypted_password` (using `crypt(3)`).
 - **PAM Integration**: The dynamically generated PAM stack includes:
   ```plaintext
-  auth sufficient pam_pwdfile.so /tmp/rdpgw/users.pwd
+  auth sufficient pam_pwdfile.so pwdfile=/tmp/rdpgw/users.pwd
   ```
 - **Lifecycle**: This file is regenerated on every startup to ensure the PAM stack always reflects the current `Users` configuration.
 
@@ -300,23 +300,28 @@ For the `users` backend (static YAML credentials) to work within the PAM `Basic`
 ## 6. Stateful PAM Branching via `pam_exec` & Skip Logic
 
 ### 6.1 Session Manager Script Installation & Location
-- The script `session_manager.sh` is installed **alongside `auth` binary** at `/opt/rdpgw/session_manager.sh` (mode `0755`).
+- The script `session_manager.sh` (source: `cmd/auth/pamstack/session_manager.sh`) is installed **alongside the `auth` binary** at `/opt/rdpgw/session_manager.sh` (mode `0755`); the daemon also rewrites it at startup.
 - Runtime session files are stored under `/tmp/pam/sessions/` (mode `0700`).
 
 ```sh
 #!/bin/sh
-BASE_DIR="/tmp/pam/sessions"
+BASE_DIR="${RDPGW_PAM_SESSION_DIR:-/tmp/pam/sessions}"
 
-SAFE_USER=$(echo "$PAM_USER" | tr '/' '_')
-TARGET_FILE="${BASE_DIR}/${SAFE_USER}"
+# Injected by rdpgw-auth into the PAM environment: a fresh GUID per attempt.
+# There is no username fallback; a missing id fails closed.
+SESSION_ID="${RDPGW_SESSION_ID:-}"
+SAFE_SESSION=$(echo "$SESSION_ID" | tr -c 'A-Za-z0-9._-' '_')
+TARGET_FILE="${BASE_DIR}/${SAFE_SESSION}"
 
 case "$1" in
     "create")
+        [ -n "$SAFE_SESSION" ] || exit 1
         mkdir -p "$BASE_DIR"
         chmod 0700 "$BASE_DIR"
         echo "$2" > "$TARGET_FILE"
         ;;
     "check")
+        [ -n "$SAFE_SESSION" ] || exit 1
         if [ -f "$TARGET_FILE" ] && [ "$(cat "$TARGET_FILE")" = "$2" ]; then
             exit 0
         else
@@ -324,9 +329,8 @@ case "$1" in
         fi
         ;;
     "cleanup")
-        if [ -n "$SAFE_USER" ]; then
-            rm -f "$TARGET_FILE"
-        fi
+        [ -n "$SAFE_SESSION" ] || exit 1
+        rm -f "$TARGET_FILE"
         ;;
     *)
         exit 1
@@ -346,29 +350,32 @@ To avoid arithmetic guesswork when calculating line jumps across variable-length
 # --- AUTH PHASE ---
 # Example: Winbind block with OATH (2 auth modules + 1 session create = 3 lines block)
 auth [success=ok default=2]       pam_oath.so usersfile=/etc/users.oath
-auth [success=ok default=1]       pam_winbind.so krb5_auth
-auth [success=done]               pam_exec.so /opt/rdpgw/session_manager.sh create winbind
+auth [success=ok default=1]       pam_winbind.so
+auth [success=done default=die]   pam_exec.so /opt/rdpgw/session_manager.sh create winbind
 
 # Example: Unix block (1 auth module + 1 session create = 2 lines block)
 auth [success=ok default=1]       pam_unix.so nullok try_first_pass
-auth [success=done]               pam_exec.so /opt/rdpgw/session_manager.sh create unix
+auth [success=done default=die]   pam_exec.so /opt/rdpgw/session_manager.sh create unix
 
 # Fallback Deny
 auth required                     pam_deny.so
 
 # --- ACCOUNT PHASE ---
-account [success=2 default=ignore] pam_exec.so quiet /opt/rdpgw/session_manager.sh check winbind
-account [success=1 user_unknown=die default=ignore] pam_winbind.so
-account required                                       pam_deny.so
-account [success=done]                                 pam_exec.so /opt/rdpgw/session_manager.sh cleanup
+account [success=ok default=2]    pam_exec.so quiet /opt/rdpgw/session_manager.sh check winbind
+account [success=ok default=die]  pam_permit.so
+account [success=done default=done] pam_exec.so quiet /opt/rdpgw/session_manager.sh cleanup
 
-account [success=2 default=ignore] pam_exec.so quiet /opt/rdpgw/session_manager.sh check unix
-account [success=1 default=ignore]                  pam_unix.so
-account required                                       pam_deny.so
-account [success=done]                                 pam_exec.so /opt/rdpgw/session_manager.sh cleanup
+account [success=ok default=2]    pam_exec.so quiet /opt/rdpgw/session_manager.sh check unix
+account [success=ok default=die]  pam_unix.so
+account [success=done default=done] pam_exec.so quiet /opt/rdpgw/session_manager.sh cleanup
 
-account [success=done]                                 pam_permit.so
+account required                  pam_deny.so
 ```
+
+`pam_winbind.so` is used without `krb5_auth`, and its account module is
+replaced by `pam_permit.so`: both `krb5_auth` and `pam_winbind`'s account
+phase call `getpwnam()` first, which cannot resolve domain users on the
+musl-based image (no NSS). See `docs/pam-authentication.md`.
 
 ---
 
@@ -380,7 +387,7 @@ account [success=done]                                 pam_permit.so
 - Copy `session_manager.sh` to `/opt/rdpgw/session_manager.sh`.
 - Set container entrypoint directly to the compiled Go binary:
   ```dockerfile
-  COPY cmd/auth/scripts/session_manager.sh /opt/rdpgw/session_manager.sh
+  COPY cmd/auth/pamstack/session_manager.sh /opt/rdpgw/session_manager.sh
   RUN chmod 0755 /opt/rdpgw/session_manager.sh
   ENTRYPOINT ["/opt/rdpgw/rdpgw-auth"]
   ```

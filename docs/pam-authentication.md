@@ -18,6 +18,78 @@ PAM authentication uses a privilege separation model with the `rdpgw-auth` helpe
 - `rdpgw-auth` - Authentication helper (runs as root or setuid)
 - Communication via Unix socket
 
+## PAM stack: hand-written or generated
+
+You have two options, and both remain supported:
+
+1. **Hand-driven PAM configuration (classic, and still fully supported).** You
+   write `/etc/pam.d/rdpgw` yourself exactly as described below and leave
+   `AuthProtocols.Basic` disabled in `rdpgw-auth.yaml`. Without an enabled
+   Basic protocol `rdpgw-auth` never touches `/etc/pam.d/rdpgw`, and PAM
+   modules are configured the standard way (pam_ldap.conf, smb.conf,
+   /etc/shadow...). This is the right choice for non-container hosts and for
+   setups with unusual PAM requirements.
+
+2. **Generated PAM stack (modern).** Enable `AuthProtocols.Basic` in
+   `rdpgw-auth.yaml` and `rdpgw-auth` generates `/etc/pam.d/rdpgw` at every
+   startup from an ordered `stack` of backends — `winbind`, `ldap`,
+   `unix`, `users` — each optionally chained with an OATH (TOTP/HOTP)
+   policy. Companion files are generated too:
+   - `/tmp/rdpgw/users.pwd`: `pam_pwdfile` database of the YAML `Users` list
+     (SHA-512 crypt, random salt per start, mode `0600`);
+   - per-profile LDAP client files for every referenced `Ldap` entry
+     (contain the bind password, mode `0600`);
+   - `/opt/rdpgw/session_manager.sh`: a `pam_exec` helper that records which
+     backend won the `auth` phase and steers the `account` phase to the same
+     backend. The daemon injects a fresh per-attempt `RDPGW_SESSION_ID` into
+     the PAM environment, so concurrent logins for the same user do not
+     interfere and a missing id fails closed.
+
+   The generated file's header is explicit — local hand edits are overwritten
+   on the next start. With the generated stack you do not manage
+   `/etc/pam_ldap.conf`, winbind's smb.conf account phase, or the users file
+   yourself. See the
+   [configuration reference](advanced-auth-configuration.md#authprotocols)
+   for the exact schema.
+
+Why the generated stack takes this route: on musl-based (Alpine) images
+there is no NSS, so a `getpwnam`-style local lookup fails for domain users
+and the PAM `account` phase cannot be resolved reliably. The account phase
+must deterministically match whichever backend succeeded during the `auth`
+phase; `session_manager.sh` + `pam_exec` control-flag jumps provide that
+without arithmetic skip-count changes when you reorder the stack. Details in
+`docs/plans/auth-migration-plan.md`.
+
+The generated winbind block is:
+
+```text
+auth    [success=ok default=1]       pam_winbind.so
+auth    [success=done default=die]   pam_exec.so /opt/rdpgw/session_manager.sh create winbind
+
+account [success=ok default=2]       pam_exec.so quiet /opt/rdpgw/session_manager.sh check winbind
+account [success=ok default=die]     pam_permit.so
+account [success=done default=done]  pam_exec.so quiet /opt/rdpgw/session_manager.sh cleanup
+```
+
+With an OATH policy attached to the entry, a `pam_oath.so` line is prepended
+to the auth block (with `default=2`); the account block is unchanged.
+
+`krb5_auth` is deliberately not used: when set, `pam_winbind` calls
+`getpwnam()` to obtain the user's UID *before* it contacts `winbindd`. The
+musl-based Alpine image has no NSS, so domain users cannot be resolved and
+authentication fails with `PAM_USER_UNKNOWN` before the password is checked.
+Password authentication itself does not need NSS: `winbindd` validates the
+credentials directly.
+
+`pam_winbind`'s account phase is unusable there for the same reason: it starts
+with `getpwnam()` (through `valid_user()`) and would only re-check that the
+user exists. The AD logon in the auth phase already returns the account-state
+results (disabled, expired, locked out, password expired, logon-hours and
+workstation restrictions). The account block therefore first verifies that the
+`winbind` block authenticated (`session_manager.sh check winbind`) and then
+accepts it with `pam_permit`; if the check does not match, the control flags
+skip `pam_permit` and the final `pam_deny` rejects the login.
+
 ## Configuration
 
 ### 1. PAM Service Configuration

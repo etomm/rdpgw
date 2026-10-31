@@ -1,0 +1,4 @@
+{{- /* One account block of the generated PAM stack. If the recorded backend is not this one, jump over the account module and cleanup (2 lines). If it is, run the backend's account check and let its result decide; cleanup then terminates the stack successfully. Cleanup is best effort: the account module already decided, and a leftover record is pruned by the next create. */ -}}
+account [success=ok default=2] pam_exec.so quiet {{ .SessionManager }} check {{ .Key }}
+account [success=ok default=die] {{ .AccountModule }}
+account [success=done default=done] pam_exec.so quiet {{ .SessionManager }} cleanup

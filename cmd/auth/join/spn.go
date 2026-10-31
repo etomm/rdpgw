@@ -65,10 +65,9 @@ func NewSPNManager(conf config.Configuration) *SPNManager {
 		return m
 	}
 	m.enabled = true
+	// config.Load applies DefaultSharedKeytab and config.Validate requires
+	// the path whenever the share is enabled.
 	m.keytab = conf.AuthProtocols.Kerberos.KeytabPath
-	if m.keytab == "" {
-		m.keytab = config.DefaultSharedKeytab
-	}
 
 	var spns []string
 	spns = append(spns, conf.AuthProtocols.Kerberos.Spns...)

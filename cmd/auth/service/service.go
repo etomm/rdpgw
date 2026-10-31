@@ -7,13 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/bolkedebruin/rdpgw/cmd/auth/config"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/database"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/ntlm"
+	"github.com/bolkedebruin/rdpgw/cmd/auth/pamstack"
 	"github.com/bolkedebruin/rdpgw/shared/auth"
 	"github.com/msteinert/pam/v2"
 	"github.com/samber/lo"
@@ -28,6 +28,20 @@ type AuthService struct {
 }
 
 var _ auth.AuthenticateServer = (*AuthService)(nil)
+
+// openSession opens the PAM transaction and injects the per-attempt session
+// id; the implementation lives in pamstack. It is a variable so tests can
+// substitute a fake transaction.
+var openSession = pamstack.StartSession
+
+// endSession closes the PAM transaction. A failing pam_end is logged, not
+// fatal: the authentication result has already been decided, and taking the
+// whole daemon down would fail every other concurrent login too.
+func endSession(t pamstack.Session, sessionID, username string) {
+	if err := t.End(); err != nil {
+		log.Printf("[%s] Error ending the PAM session for user %s: %v", sessionID, username, err)
+	}
+}
 
 // New builds the auth service for the given PAM service name and loaded
 // configuration.
@@ -117,7 +131,10 @@ func newNtlmBackend(conf config.Configuration) ntlm.Backend {
 }
 
 func (s *AuthService) Authenticate(ctx context.Context, message *auth.UserPass) (*auth.AuthResponse, error) {
-	t, err := pam.StartFunc(s.serviceName, message.Username, func(s pam.Style, msg string) (string, error) {
+	// pamstack.StartSession generates the per-attempt RDPGW_SESSION_ID and
+	// injects it into the PAM environment, so the session manager can key its
+	// state on the session instead of the username.
+	t, sessionID, err := openSession(s.serviceName, message.Username, func(s pam.Style, msg string) (string, error) {
 		switch s {
 		case pam.PromptEchoOff:
 			return message.Password, nil
@@ -131,30 +148,27 @@ func (s *AuthService) Authenticate(ctx context.Context, message *auth.UserPass) 
 	r.Authenticated = false
 
 	if err != nil {
-		log.Printf("Error authenticating user: %s due to: %s", message.Username, err)
+		log.Printf("[%s] Error authenticating user: %s due to: %s", sessionID, message.Username, err)
 		r.Error = err.Error()
 		return r, err
 	}
-	defer func() {
-		err := t.End()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "end: %v\n", err)
-			os.Exit(1)
-		}
-	}()
+	// defer, not a trailing call: pam_end must run on every early return
+	// below and during panic unwinding. Go has no try/finally; defer is the
+	// cleanup mechanism.
+	defer endSession(t, sessionID, message.Username)
 	if err = t.Authenticate(0); err != nil {
-		log.Printf("Authentication for user: %s failed due to: %s", message.Username, err)
+		log.Printf("[%s] Authentication for user: %s failed due to: %s", sessionID, message.Username, err)
 		r.Error = err.Error()
 		return r, nil
 	}
 
 	if err = t.AcctMgmt(0); err != nil {
-		log.Printf("Account authorization for user: %s failed due to %s", message.Username, err)
+		log.Printf("[%s] Account authorization for user: %s failed due to %s", sessionID, message.Username, err)
 		r.Error = err.Error()
 		return r, nil
 	}
 
-	log.Printf("User: %s authenticated", message.Username)
+	log.Printf("[%s] User: %s authenticated", sessionID, message.Username)
 	r.Authenticated = true
 	return r, nil
 }
