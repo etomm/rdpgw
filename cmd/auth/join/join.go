@@ -1,6 +1,7 @@
-// Package join implements the rdpgw-auth Active Directory join policy: the
+// Package join implements the rdpgw-auth Active Directory integration: the
 // `net ads testjoin` pre-check, the autoJoin retry loop with the join
-// credentials, and the operator-driven manual wait.
+// credentials, the operator-driven manual wait, and the shared keytab/SPN
+// maintenance that follows the join.
 package join
 
 import (
@@ -58,6 +59,8 @@ var runCommand = func(ctx context.Context, name string, args ...string) error {
 //     the join budget, using AD_JOIN_USER / AD_JOIN_PASSWORD.
 type Joiner struct {
 	winbind config.WinbindConfig
+	// spns maintains the shared keytab and the registered SPNs after the join.
+	spns *SPNManager
 
 	// timeout is the join budget (joinTimeout minutes, default 10).
 	timeout time.Duration
@@ -71,7 +74,8 @@ type Joiner struct {
 	env func(string) string
 }
 
-// New builds a Joiner for the deployment.
+// New builds a Joiner for the deployment. It owns both the join policy and
+// the keytab/SPN maintenance that follows a successful join.
 func New(conf config.Configuration) *Joiner {
 	cfg := config.WinbindConfig{}
 	if conf.Winbind != nil {
@@ -83,6 +87,7 @@ func New(conf config.Configuration) *Joiner {
 	}
 	return &Joiner{
 		winbind:        cfg,
+		spns:           NewSPNManager(conf),
 		timeout:        time.Duration(minutes) * time.Minute,
 		poll:           joinPollInterval,
 		backoffInitial: joinRetryInitial,
@@ -92,11 +97,17 @@ func New(conf config.Configuration) *Joiner {
 	}
 }
 
-// Ensure runs the configured join policy. It is the single entry point used
-// by the daemon.
+// Ensure runs the configured join policy and, when the deployment shares a
+// Kerberos keytab, refreshes and verifies the SPNs that follow the join. It
+// is the single entry point used by the daemon.
 func (j *Joiner) Ensure(ctx context.Context) error {
 	if err := j.EnsureJoined(ctx); err != nil {
 		return fmt.Errorf("domain join: %w", err)
+	}
+	if j.spns != nil {
+		if err := j.spns.EnsureSPNs(ctx); err != nil {
+			return fmt.Errorf("SPN provisioning: %w", err)
+		}
 	}
 	return nil
 }

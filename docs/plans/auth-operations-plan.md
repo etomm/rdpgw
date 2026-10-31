@@ -58,7 +58,7 @@ Go supervisor before the join logic moves.
 - Wiring in `cmd/auth/auth.go`.
 - Slimmed `dev/docker/run-auth-winbind.sh`.
 
-### Milestone 3b: Domain Join and Keytab Directive Rewriting
+### Milestone 3b: Domain Join, Keytab and SPN Management
 #### Status
 - Delivered on `feature/milestone-3b-domain-join`.
 
@@ -66,11 +66,11 @@ Go supervisor before the join logic moves.
 - Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop (2s → 30s), configurable `JoinTimeout` (default 10 min), and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined. `autoJoin: false` waits for a manual join and prints the instructions immediately.
 - Run the join in the root supervisor before `winbindd` starts (external-winbind deployments delegate the join to the host).
 - Migrate the join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join/`.
+- Migrate keytab creation and SPN management into `cmd/auth/join/`: refresh the keytab (`net ads keytab create -P`), collect SPNs from `AuthProtocols.Kerberos.Spns` (legacy `ntlm.winbind.spns` maps there), `KERBEROS_SPNS` and `HTTP/<GatewayAddress>` from `RDPGW_CONF`, register missing SPNs with the join credentials, otherwise print manual instructions and wait for them to appear in `klist -k`, then make the keytab readable by the gateway (0644).
 - When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy would leave both lines on a writable mis-pointed operator file; samba reads them ambiguously). The authoritative directives are `kerberos method`, `dedicated keytab file` and `sync machine password to keytab`.
-- Keytab creation and SPN registration stay in the entrypoint script until the container-streamlining milestone.
 
 #### Deliverables
-- `cmd/auth/join/`, the in-place keytab rewrite in `cmd/auth/provisioning/`, and the corresponding script cleanup.
+- `cmd/auth/join/` (domain join, keytab and SPN management), the in-place keytab rewrite in `cmd/auth/provisioning/`, and the corresponding script cleanup.
 
 ---
 

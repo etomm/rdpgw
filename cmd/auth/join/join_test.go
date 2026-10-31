@@ -3,6 +3,7 @@ package join
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -213,5 +214,38 @@ func TestJoinerAutoJoinTimesOut(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&joinAttempts); got < 2 {
 		t.Errorf("join attempts = %d, want repeated retries with backoff", got)
+	}
+}
+
+func TestEnsureRunsSPNsAfterJoin(t *testing.T) {
+	j := testJoiner(true)
+	j.run = func(_ context.Context, name string, args ...string) error {
+		if name == netBinary && len(args) > 1 && args[1] == "testjoin" {
+			return nil // already joined
+		}
+		return errors.New("unexpected command")
+	}
+
+	var klistCalls int32
+	j.spns = &SPNManager{
+		enabled: true,
+		keytab:  filepath.Join(t.TempDir(), "rdpgw.keytab"),
+		spns:    []string{"HTTP/a.example.com"},
+		poll:    time.Millisecond,
+		env:     func(string) string { return "" },
+		run: func(_ context.Context, name string, _ ...string) (string, error) {
+			if name == klistBinary {
+				atomic.AddInt32(&klistCalls, 1)
+				return "Principal HTTP/a.example.com\n", nil
+			}
+			return "", nil
+		},
+	}
+
+	if err := j.Ensure(context.Background()); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if got := atomic.LoadInt32(&klistCalls); got == 0 {
+		t.Error("Ensure did not run the SPN/keytab checks")
 	}
 }
