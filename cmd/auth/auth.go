@@ -201,6 +201,13 @@ func main() {
 
 	conf = config.Load(opts.ConfigFile)
 
+	// Stage and reconcile samba/kerberos files before any
+	// join or supervision happens (Milestones 3+). Without winbind
+	// capability this is a logged no-op.
+	if err := Provision(conf); err != nil {
+		log.Fatalf("Provisioning failed: %v", err)
+	}
+
 	log.Printf("Starting auth server on %s", opts.SocketAddr)
 	cleanup := func() {
 		if _, err := os.Stat(opts.SocketAddr); err == nil {

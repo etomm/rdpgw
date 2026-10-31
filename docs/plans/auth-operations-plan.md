@@ -39,6 +39,7 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 - Migrate the shell wrapper logic (`run-auth-winbind.sh`) entirely into Go (`cmd/auth/join.go` and `cmd/auth/supervisor.go`).
 - Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop, configurable `JoinTimeout`, and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined.
 - Implement `winbindd` child process supervision (`os/exec`), stdout/stderr redirection, `wbinfo -p` health polling, and graceful signal propagation (`SIGTERM`/`SIGINT`).
+- When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy leaves both lines on a writable mis-pointed operator file; samba reads them ambiguously).
 
 ### Deliverables
 - Go-based AD domain join and `winbindd` supervision engine.
