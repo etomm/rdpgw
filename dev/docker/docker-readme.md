@@ -49,7 +49,7 @@ docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth-winbind .
 ways to provide that:
 
 1. **Run winbindd in the container.** Mount a domain member `smb.conf` and a
-   persistent `/var/lib/samba` volume. The container can join the domain automatically if you pass `AD_JOIN_USER` and `AD_JOIN_PASSWORD`, or wait cleanly for a manual join (`net ads join -U Administrator`). Once joined, the state is persisted in `/var/lib/samba` across restarts. The entrypoint starts `winbindd`, waits for it, and runs `rdpgw-auth` as UID 1001.
+   persistent `/var/lib/samba` volume. The container can join the domain automatically if you pass `AD_JOIN_USER` and `AD_JOIN_PASSWORD`, or wait cleanly for a manual join (`net ads join -U Administrator`). Once joined, the state is persisted in `/var/lib/samba` across restarts. `rdpgw-auth` starts and supervises `winbindd` itself (readiness check via `wbinfo -p`, graceful stop on SIGTERM) and runs the gRPC server as UID 1001.
 
    ```bash
    # Automatic join on first start:

@@ -1,13 +1,14 @@
 #!/bin/sh
 # Entrypoint for Dockerfile.auth-winbind.
 #
-# By default winbindd is started inside the container. This requires
-# /etc/samba/smb.conf and the domain join state (/var/lib/samba) to be
-# provided, e.g. as volumes from a previous "net ads join".
+# This script prepares the container filesystem and the domain membership
+# (join, keytab, SPNs). winbindd itself is started, health-checked and
+# supervised by rdpgw-auth, which therefore runs as root in this image.
 #
-# Set RDPGW_AUTH_EXTERNAL_WINBIND=1 to skip starting winbindd and use the
+# Set RDPGW_AUTH_EXTERNAL_WINBIND=1 to skip the local winbindd and use the
 # winbind of a domain-joined host instead (mount its /run/samba and
-# /var/lib/samba/winbindd_privileged into the container).
+# /var/lib/samba/winbindd_privileged into the container). rdpgw-auth then
+# only waits for that external winbindd.
 set -e
 
 PRIV_DIR=/var/lib/samba/winbindd_privileged
@@ -138,28 +139,11 @@ if [ "${RDPGW_AUTH_EXTERNAL_WINBIND}" != "1" ]; then
   else
     echo "WARNING: Keytab not found at ${KEYTAB_PATH}" >&2
   fi
-
-  echo "Starting winbindd"
-  winbindd -F --no-process-group --debug-stdout -d 2 &
 fi
 
-# Wait until winbindd answers before accepting authentication requests.
-i=0
-until wbinfo -p >/dev/null 2>&1; do
-  i=$((i + 1))
-  if [ "${i}" -ge 30 ]; then
-    echo "winbindd is not responding (wbinfo -p failed)" >&2
-    cat /var/log/samba/log.winbindd >&2 2>/dev/null || true
-    exit 1
-  fi
-  sleep 1
-done
-
-# Ensure winbindd_privileged Remains accessible to winbindd_priv group after winbindd initializes it.
-if [ -d "${PRIV_DIR}" ] && [ "${RDPGW_AUTH_EXTERNAL_WINBIND}" != "1" ]; then
-  chgrp winbindd_priv "${PRIV_DIR}"
-  chmod 0750 "${PRIV_DIR}"
-fi
-
+# winbindd itself is started, health-checked (wbinfo -p) and supervised by
+# rdpgw-auth: it owns the child process, mirrors its output and stops it on
+# SIGTERM/SIGINT. With RDPGW_AUTH_EXTERNAL_WINBIND=1 it only waits for the
+# host-provided winbindd and never starts a second one.
 echo "Starting rdpgw-auth"
-exec su-exec rdpgw /opt/rdpgw/rdpgw-auth "$@"
+exec /opt/rdpgw/rdpgw-auth --serve-user rdpgw "$@"

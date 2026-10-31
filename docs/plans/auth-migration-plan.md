@@ -288,7 +288,7 @@ For the `users` backend (static YAML credentials) to work within the PAM `Basic`
   - **If `AutoJoin: false`**:
     - Do not attempt automatic join. Enter a wait loop lasting `JoinTimeout` minutes, reporting as the first log message clear instructions on how to perform that manual join (e.g., `net ads join -U Administrator`), and clarifying that the daemon is waiting for it. If timeout expires without join, **explode (`log.Fatalf`)**.
 
-### 5.2 Subprocess Supervision (`cmd/auth/supervisor.go`)
+### 5.2 Subprocess Supervision (`cmd/auth/supervisor/`)
 - Executed via an operator-configurable command / arguments (e.g. supporting custom debug levels like `-d 5` instead of hardcoded `-d 2`).
 - Default command: `winbindd -F --no-process-group --debug-stdout -d 2`.
 - Pipe stdout/stderr to Go logger with prefix `[winbindd]`.

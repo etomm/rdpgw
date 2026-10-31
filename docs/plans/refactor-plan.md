@@ -98,7 +98,7 @@ mirror must be manually kept in sync with `auth.go` after each change.
   debugger session ends uncleanly; currently one file is stuck held by a
   live process.
 - `gofmt -l` still lists a handful of pre-existing files
-  (`cmd/auth/database/*`, `cmd/auth/peercred_linux.go`,
+  (`cmd/auth/database/*`, `cmd/auth/serve/peercred_linux.go`,
   `cmd/auth/ntlm/ntlm_test.go`) that predate the current refactor wave.
 
 ### Proposal

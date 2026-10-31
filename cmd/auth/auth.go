@@ -5,25 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"os"
-	"strings"
+	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/bolkedebruin/rdpgw/cmd/auth/config"
-	"github.com/bolkedebruin/rdpgw/cmd/auth/database"
-	"github.com/bolkedebruin/rdpgw/cmd/auth/ntlm"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/provisioning"
-	"github.com/bolkedebruin/rdpgw/shared/auth"
-	"github.com/msteinert/pam/v2"
-	"github.com/samber/lo"
+	"github.com/bolkedebruin/rdpgw/cmd/auth/serve"
+	"github.com/bolkedebruin/rdpgw/cmd/auth/supervisor"
 	"github.com/thought-machine/go-flags"
-	"google.golang.org/grpc"
-)
-
-const (
-	protocol = "unix"
 )
 
 var opts struct {
@@ -32,159 +22,15 @@ var opts struct {
 	ConfigFile  string `short:"c" long:"conf" default:"rdpgw-auth.yaml" description:"users config file for NTLM (yaml)"`
 	AllowUID    []int  `long:"allow-uid" description:"additional UIDs allowed to connect to the socket; the daemon's own UID is always allowed (repeatable)"`
 	AllowGID    []int  `long:"allow-gid" description:"GIDs allowed to connect to the socket (repeatable)"`
-}
 
-type AuthServiceImpl struct {
-	auth.UnimplementedAuthenticateServer
-
-	serviceName string
-	ntlm        *ntlm.NTLMAuth
-}
-
-var conf config.Configuration
-var _ auth.AuthenticateServer = (*AuthServiceImpl)(nil)
-
-func NewAuthService(serviceName string, backend ntlm.Backend) auth.AuthenticateServer {
-	s := &AuthServiceImpl{
-		serviceName: serviceName,
-		ntlm:        ntlm.NewNTLMAuthWithBackend(backend),
-	}
-	return s
-}
-
-// newNtlmBackend maps AuthProtocols.Ntlm onto NTLM verifiers. Backends
-// entries map to verifiers in order: "winbind" to Samba's ntlm_auth helper
-// (which asks the domain controller via winbindd; the gateway never sees
-// any password), "users" to the in-process verifier fed by the Users list.
-// A configuration with a single usable backend returns that backend
-// directly; multiple usable backends are chained with the ordered
-// alternative/exclusive execution. Whenever NTLM is unusable — the protocol
-// is not configured, explicitly disabled, or no listed backend could be
-// built — an explicit-denial NullBackend is installed so the auth service
-// stays up and reports the misconfiguration instead of silently falling
-// back to another verifier.
-func newNtlmBackend(conf config.Configuration) ntlm.Backend {
-	ntlmProto := conf.AuthProtocols
-	switch {
-	case ntlmProto == nil || ntlmProto.Ntlm == nil:
-		// AuthProtocols absent, or only other protocols (e.g. Kerberos) enabled.
-		return &ntlm.NullBackend{Reason: "AuthProtocols.Ntlm is not configured"}
-	case !ntlmProto.Ntlm.Enabled:
-		// Disabled means disabled: NTLM handshakes must be denied, never
-		// served by a lucky fallback verifier.
-		return &ntlm.NullBackend{Reason: "AuthProtocols.Ntlm is disabled by configuration"}
-	default:
-		var chain []ntlm.Backend
-		var usingUsersBackend bool
-
-		backends := lo.Map(ntlmProto.Ntlm.Backends, func(b string, _ int) string { return strings.ToLower(b) })
-		backends = lo.Uniq(backends)
-
-		for _, b := range backends {
-			switch b {
-			case config.NtlmBackendWinbind:
-				w := conf.Winbind
-				if w == nil {
-					// Validation guarantees Winbind presence; skip defensively.
-					log.Printf("NTLM: winbind backend requested but Winbind is not configured, skipping")
-					continue
-				}
-				log.Printf("NTLM: using winbind backend (%s)", w.NtlmAuthPath)
-				sep := w.Separator
-				if sep == 0 {
-					sep = config.DefaultSeparator
-				}
-				chain = append(chain, &ntlm.WinbindBackend{
-					NtlmAuthPath:        w.NtlmAuthPath,
-					Domain:              w.Workgroup, // legacy ntlm_auth --domain (NetBIOS workgroup)
-					RequireMembershipOf: w.RequireMembershipOf,
-					Timeout:             time.Duration(w.Timeout) * time.Second,
-					StripDomain:         w.StripDomain,
-					Separator:           sep.String(),
-				})
-			case config.NtlmBackendUsers, config.NtlmBackendLegacyFile:
-				usingUsersBackend = true
-				if len(conf.Users) > 0 {
-					log.Printf("NTLM: using users backend with %d user(s)", len(conf.Users))
-				} else {
-					log.Printf("NTLM: warning: using users backend without users")
-				}
-				chain = append(chain, ntlm.NewLocalBackend(database.NewConfig(conf.Users)))
-			default:
-				log.Printf("NTLM: warning: unknown backend %q skipped", b)
-			}
-		}
-
-		if !usingUsersBackend && len(conf.Users) > 0 {
-			log.Printf("NTLM: warning: Users list is ignored with the winbind backend")
-		}
-
-		switch len(chain) {
-		case 0:
-			return &ntlm.NullBackend{Reason: fmt.Sprintf("AuthProtocols.Ntlm contains no usable backend (configured: %v)", backends)}
-		case 1:
-			return chain[0]
-		default:
-			return ntlm.NewOrderedBackend(chain...)
-		}
-	}
-}
-
-func (s *AuthServiceImpl) Authenticate(ctx context.Context, message *auth.UserPass) (*auth.AuthResponse, error) {
-	t, err := pam.StartFunc(s.serviceName, message.Username, func(s pam.Style, msg string) (string, error) {
-		switch s {
-		case pam.PromptEchoOff:
-			return message.Password, nil
-		case pam.PromptEchoOn, pam.ErrorMsg, pam.TextInfo:
-			return "", nil
-		}
-		return "", errors.New("unrecognized PAM message style")
-	})
-
-	r := &auth.AuthResponse{}
-	r.Authenticated = false
-
-	if err != nil {
-		log.Printf("Error authenticating user: %s due to: %s", message.Username, err)
-		r.Error = err.Error()
-		return r, err
-	}
-	defer func() {
-		err := t.End()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "end: %v\n", err)
-			os.Exit(1)
-		}
-	}()
-	if err = t.Authenticate(0); err != nil {
-		log.Printf("Authentication for user: %s failed due to: %s", message.Username, err)
-		r.Error = err.Error()
-		return r, nil
-	}
-
-	if err = t.AcctMgmt(0); err != nil {
-		log.Printf("Account authorization for user: %s failed due to %s", message.Username, err)
-		r.Error = err.Error()
-		return r, nil
-	}
-
-	log.Printf("User: %s authenticated", message.Username)
-	r.Authenticated = true
-	return r, nil
-}
-
-func (s *AuthServiceImpl) NTLM(ctx context.Context, message *auth.NtlmRequest) (*auth.NtlmResponse, error) {
-	r, err := s.ntlm.Authenticate(message)
-
-	if err != nil {
-		log.Printf("[%s] NTLM failed: %s", message.Session, err)
-	} else if r.Authenticated {
-		log.Printf("[%s] User: %s authenticated using NTLM", message.Session, r.Username)
-	} else if r.NtlmMessage != "" {
-		log.Printf("[%s] Sending NTLM challenge", message.Session)
-	}
-
-	return r, err
+	// ServeUser switches the gRPC server to an unprivileged user after
+	// winbindd has been started. The winbind image runs rdpgw-auth as
+	// root (winbindd needs samba's root-owned state) and passes
+	// `--serve-user rdpgw`, reproducing the old `su-exec rdpgw` step.
+	ServeUser string `long:"serve-user" description:"run the gRPC server as this user after starting winbindd (requires root)"`
+	// Serve is the internal child mode: provisioning, domain join and
+	// winbindd supervision are already done by the parent process.
+	Serve bool `long:"serve" hidden:"true" description:"internal: serve gRPC only (used by the supervisor parent)"`
 }
 
 func main() {
@@ -200,40 +46,73 @@ func main() {
 		return
 	}
 
-	conf = config.Load(opts.ConfigFile)
+	conf := config.Load(opts.ConfigFile)
 
-	// Stage and reconcile samba/kerberos files before any
-	// join or supervision happens (Milestones 3+). Without winbind
-	// capability this is a logged no-op.
+	// Internal child mode: the parent has already provisioned the files,
+	// joined the domain (Milestone 3b) and started winbindd.
+	if opts.Serve {
+		os.Exit(serve.Run(context.Background(), serveOptions(), conf, nil))
+	}
+
+	// Stage and reconcile samba/kerberos files before any join or
+	// supervision happens. Without winbind capability this is a no-op.
 	if err := provisioning.Provision(conf); err != nil {
 		log.Fatalf("Provisioning failed: %v", err)
 	}
 
-	log.Printf("Starting auth server on %s", opts.SocketAddr)
-	cleanup := func() {
-		if _, err := os.Stat(opts.SocketAddr); err == nil {
-			if err := os.RemoveAll(opts.SocketAddr); err != nil {
-				log.Fatal(err)
+	// SIGTERM/SIGINT must reach the shutdown path: it stops winbindd and
+	// removes the socket instead of leaving both behind for the next pod.
+	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stopSignals()
+
+	// winbindd supervision only applies when the deployment actually
+	// needs winbind (Kerberos keytab share or the winbind NTLM backend);
+	// otherwise the daemon is a plain local-auth service. The external
+	// mode (host-provided winbind) only waits for readiness, it must not
+	// spawn a second winbindd.
+	var winbindd *supervisor.Supervisor
+	if provisioning.UsesWinbind(conf) {
+		if conf.Winbind == nil {
+			log.Fatalf("Winbind capability requested but the Winbind configuration block is missing")
+		}
+		winbindd = supervisor.New()
+		if supervisor.External() {
+			log.Printf("Supervisor: external winbindd mode, not starting a child")
+			readyCtx, cancel := context.WithTimeout(ctx, supervisor.ExternalReadyTimeout)
+			err := winbindd.WaitReady(readyCtx)
+			cancel()
+			if err != nil {
+				log.Fatalf("External winbindd is not responding: %v", err)
+			}
+		} else {
+			if err := winbindd.Start(); err != nil {
+				log.Fatalf("%v", err)
+			}
+			if err := winbindd.WaitReady(ctx); err != nil {
+				_ = winbindd.Stop()
+				log.Fatalf("%v", err)
 			}
 		}
 	}
-	cleanup()
 
-	oldUmask := syscall.Umask(0117)
-	listener, err := net.Listen(protocol, opts.SocketAddr)
-	syscall.Umask(oldUmask)
-	if err != nil {
-		log.Fatal(err)
+	code := serve.Run(ctx, serveOptions(), conf, winbindd)
+
+	if winbindd != nil {
+		if err := winbindd.Stop(); err != nil {
+			log.Printf("Stopping winbindd: %v", err)
+		}
 	}
+	os.Exit(code)
+}
 
-	// The daemon's own UID is always permitted; additional callers must
-	// be enumerated by the operator. This stops any local user on a
-	// shared host from speaking gRPC against the PAM oracle.
-	allowedUIDs := append([]int{os.Getuid()}, opts.AllowUID...)
-	listener = newGatedListener(listener, allowedUIDs, opts.AllowGID)
-
-	server := grpc.NewServer()
-	service := NewAuthService(opts.ServiceName, newNtlmBackend(conf))
-	auth.RegisterAuthenticateServer(server, service)
-	server.Serve(listener)
+// serveOptions maps the CLI flags onto the serving package options.
+func serveOptions() serve.Options {
+	return serve.Options{
+		SocketAddr:  opts.SocketAddr,
+		ServiceName: opts.ServiceName,
+		AllowedUIDs: opts.AllowUID,
+		AllowedGIDs: opts.AllowGID,
+		User:        opts.ServeUser,
+		Child:       opts.Serve,
+	}
 }

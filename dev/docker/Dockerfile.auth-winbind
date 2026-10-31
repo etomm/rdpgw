@@ -36,6 +36,7 @@ COPY dev/docker/rdpgw-pam /etc/pam.d/rdpgw
 COPY dev/docker/run-auth-winbind.sh /run-auth-winbind.sh
 
 WORKDIR /opt/rdpgw
-# The entrypoint starts as root so it can run winbindd; rdpgw-auth itself
-# is started as the unprivileged rdpgw user (UID 1001).
+# The entrypoint and rdpgw-auth run as root: rdpgw-auth supervises the
+# winbindd child, which needs root for the samba private/privileged dirs.
+# The gRPC socket stays UID-gated by --allow-uid/--allow-gid.
 ENTRYPOINT ["/bin/sh", "/run-auth-winbind.sh"]

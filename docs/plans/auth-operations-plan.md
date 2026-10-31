@@ -34,15 +34,35 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 
 ---
 
-## Milestone 3: Domain Join, Process Supervision, and Script Migration
-### Scope
-- Migrate the shell wrapper logic (`run-auth-winbind.sh`) entirely into Go (`cmd/auth/join.go` and `cmd/auth/supervisor.go`).
+## Milestone 3: Process Supervision, Domain Join, and Script Migration
+
+Split into two shippable deliverables so the container can switch to the
+Go supervisor before the join logic moves.
+
+### Milestone 3a: `winbindd` Supervision (first deliverable)
+#### Scope
+- Supervise `winbindd` from `rdpgw-auth` (`os/exec`): command line mirrors the legacy `winbindd -F --no-process-group --debug-stdout -d 2`, with `RDPGW_WINBIND_PATH` and `RDPGW_WINBIND_DEBUG` as deployment overrides (environment variables, not configuration schema). stdout/stderr are mirrored into the Go logger with a `[winbindd]` prefix.
+- `wbinfo -p` readiness polling before the gRPC socket is opened.
+- Graceful signal propagation (`SIGTERM`/`SIGINT`): stop `winbindd` (SIGTERM, then SIGKILL after a grace period), remove the socket and exit cleanly.
+- Honour `RDPGW_AUTH_EXTERNAL_WINBIND=1`: wait for the host-provided winbindd instead of spawning one.
+- Replace the `winbindd ... &` / `wbinfo -p` wait block at the end of `run-auth-winbind.sh` with `exec rdpgw-auth --serve-user rdpgw`; the script keeps the filesystem/join/keytab preparation for now.
+- The parent process stays root (it needs the rights to stop `winbindd`) and re-executes the gRPC server as `--serve-user rdpgw` (UID 1001), replacing the old `su-exec` step. The socket therefore keeps its previous owner and the UID/GID gate is unchanged.
+
+#### Deliverables
+- `cmd/auth/supervisor/` (winbindd supervisor, readiness probe, shutdown, re-exec child runner).
+- `cmd/auth/serve/` (unix socket, peer-credential gate, gRPC lifecycle, `--serve-user` privilege drop).
+- `cmd/auth/service/` (PAM/NTLM gRPC API and backend selection).
+- Wiring in `cmd/auth/auth.go`.
+- Slimmed `dev/docker/run-auth-winbind.sh`.
+
+### Milestone 3b: Domain Join and Remaining Script Migration
+#### Scope
 - Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop, configurable `JoinTimeout`, and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined.
-- Implement `winbindd` child process supervision (`os/exec`), stdout/stderr redirection, `wbinfo -p` health polling, and graceful signal propagation (`SIGTERM`/`SIGINT`).
+- Migrate the remaining join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join.go`.
 - When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy leaves both lines on a writable mis-pointed operator file; samba reads them ambiguously).
 
-### Deliverables
-- Go-based AD domain join and `winbindd` supervision engine.
+#### Deliverables
+- `cmd/auth/join.go` and the corresponding script cleanup.
 
 ---
 
