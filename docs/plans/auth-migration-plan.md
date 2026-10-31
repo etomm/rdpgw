@@ -276,7 +276,7 @@ For the `users` backend (static YAML credentials) to work within the PAM `Basic`
 
 ## 5. Active Directory Automation & Subprocess Supervision
 
-### 5.1 Automated Domain Join (`cmd/auth/join.go`)
+### 5.1 Automated Domain Join (`cmd/auth/join/`)
 - **Conditional Check**: Domain join logic is executed **only if the Winbind backend is compiled/configured**. If Winbind is absent, join logic is entirely bypassed.
 - **Join Test (`net ads testjoin`)**:
   - Execute `net ads testjoin`. If return code `0`, domain join is active; skip join sequence.

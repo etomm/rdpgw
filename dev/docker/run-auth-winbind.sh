@@ -1,9 +1,10 @@
 #!/bin/sh
 # Entrypoint for Dockerfile.auth-winbind.
 #
-# This script prepares the container filesystem and the domain membership
-# (join, keytab, SPNs). winbindd itself is started, health-checked and
-# supervised by rdpgw-auth, which therefore runs as root in this image.
+# This script prepares the container filesystem and the keytab/SPN side of
+# the domain membership. Domain join, winbindd startup/health-checking and
+# supervision all happen in rdpgw-auth, which therefore runs as root in this
+# image (and re-executes its gRPC server as the unprivileged rdpgw user).
 #
 # Set RDPGW_AUTH_EXTERNAL_WINBIND=1 to skip the local winbindd and use the
 # winbind of a domain-joined host instead (mount its /run/samba and
@@ -33,28 +34,8 @@ if [ "${RDPGW_AUTH_EXTERNAL_WINBIND}" != "1" ]; then
     fi
   fi
 
-  if ! net ads testjoin >/dev/null 2>&1; then
-    if [ -n "${AD_JOIN_USER}" ] && [ -n "${AD_JOIN_PASSWORD}" ]; then
-      echo "Joining Active Directory domain as ${AD_JOIN_USER}..."
-      net ads join -U "${AD_JOIN_USER}%${AD_JOIN_PASSWORD}"
-    else
-      echo "--------------------------------------------------------------------------------" >&2
-      echo "WARNING: Domain join state not found or invalid, and no credentials provided." >&2
-      echo "Please configure AD_JOIN_USER and AD_JOIN_PASSWORD environment variables/secrets," >&2
-      echo "OR manually join by executing a shell INSIDE this container and running:" >&2
-      echo "    net ads join -U Administrator" >&2
-      echo "" >&2
-      echo "Examples to access the container:" >&2
-      echo "  - Kubernetes: kubectl exec -it <pod-name> -n <namespace> -c rdpgw-auth -- sh" >&2
-      echo "  - Docker:     docker exec -it <container-name> sh" >&2
-      echo "--------------------------------------------------------------------------------" >&2
-      echo "Waiting for domain join..." >&2
-      until net ads testjoin >/dev/null 2>&1; do
-        sleep 2
-      done
-      echo "Domain join detected!"
-    fi
-  fi
+  # Domain join (testjoin pre-check, auto-join with backoff, manual wait)
+  # is performed by rdpgw-auth before winbindd starts; see cmd/auth/join.go.
   # Determine keytab path dynamically from smb.conf (defaulting to /etc/samba/samba.keytab if unset)
   KEYTAB_PATH=$(testparm -s --parameter-name="dedicated keytab file" /etc/samba/smb.conf 2>/dev/null | tr -d '[:space:]')
   if [ -z "${KEYTAB_PATH}" ] || [ "${KEYTAB_PATH}" = "0" ]; then

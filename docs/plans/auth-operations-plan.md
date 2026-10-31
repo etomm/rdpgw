@@ -39,7 +39,10 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 Split into two shippable deliverables so the container can switch to the
 Go supervisor before the join logic moves.
 
-### Milestone 3a: `winbindd` Supervision (first deliverable)
+### Milestone 3a: `winbindd` Supervision (delivered, `77e3ab9`)
+#### Status
+- Completed on `feature/milestone-3a-winbindd-supervision`.
+
 #### Scope
 - Supervise `winbindd` from `rdpgw-auth` (`os/exec`): command line mirrors the legacy `winbindd -F --no-process-group --debug-stdout -d 2`, with `RDPGW_WINBIND_PATH` and `RDPGW_WINBIND_DEBUG` as deployment overrides (environment variables, not configuration schema). stdout/stderr are mirrored into the Go logger with a `[winbindd]` prefix.
 - `wbinfo -p` readiness polling before the gRPC socket is opened.
@@ -55,14 +58,19 @@ Go supervisor before the join logic moves.
 - Wiring in `cmd/auth/auth.go`.
 - Slimmed `dev/docker/run-auth-winbind.sh`.
 
-### Milestone 3b: Domain Join and Remaining Script Migration
+### Milestone 3b: Domain Join and Keytab Directive Rewriting
+#### Status
+- Delivered on `feature/milestone-3b-domain-join`.
+
 #### Scope
-- Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop, configurable `JoinTimeout`, and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined.
-- Migrate the remaining join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join.go`.
-- When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy leaves both lines on a writable mis-pointed operator file; samba reads them ambiguously).
+- Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop (2s → 30s), configurable `JoinTimeout` (default 10 min), and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined. `autoJoin: false` waits for a manual join and prints the instructions immediately.
+- Run the join in the root supervisor before `winbindd` starts (external-winbind deployments delegate the join to the host).
+- Migrate the join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join/`.
+- When rewriting keytab directives, update mis-pointed directive lines in place rather than appending duplicates (Milestone 2's append policy would leave both lines on a writable mis-pointed operator file; samba reads them ambiguously). The authoritative directives are `kerberos method`, `dedicated keytab file` and `sync machine password to keytab`.
+- Keytab creation and SPN registration stay in the entrypoint script until the container-streamlining milestone.
 
 #### Deliverables
-- `cmd/auth/join.go` and the corresponding script cleanup.
+- `cmd/auth/join/`, the in-place keytab rewrite in `cmd/auth/provisioning/`, and the corresponding script cleanup.
 
 ---
 

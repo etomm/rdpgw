@@ -10,6 +10,7 @@ import (
 	"syscall"
 
 	"github.com/bolkedebruin/rdpgw/cmd/auth/config"
+	"github.com/bolkedebruin/rdpgw/cmd/auth/join"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/provisioning"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/serve"
 	"github.com/bolkedebruin/rdpgw/cmd/auth/supervisor"
@@ -68,12 +69,21 @@ func main() {
 	// winbindd supervision only applies when the deployment actually
 	// needs winbind (Kerberos keytab share or the winbind NTLM backend);
 	// otherwise the daemon is a plain local-auth service. The external
-	// mode (host-provided winbind) only waits for readiness, it must not
-	// spawn a second winbindd.
+	// mode (host-provided winbind) only waits for readiness: the host owns
+	// the join state and the winbindd process.
 	var winbindd *supervisor.Supervisor
 	if provisioning.UsesWinbind(conf) {
 		if conf.Winbind == nil {
 			log.Fatalf("Winbind capability requested but the Winbind configuration block is missing")
+		}
+		if !supervisor.External() {
+			if err := join.New(conf).Ensure(ctx); err != nil {
+				if ctx.Err() != nil {
+					log.Printf("Shutdown requested during Active Directory provisioning")
+					return
+				}
+				log.Fatalf("Active Directory provisioning failed: %v", err)
+			}
 		}
 		winbindd = supervisor.New()
 		if supervisor.External() {
