@@ -75,17 +75,55 @@ func TestSmbConfSemanticallyEqual(t *testing.T) {
 	}
 }
 
-func TestSmbConfSeparatorContinuationIsDrift(t *testing.T) {
-	// '\\' at end of line collapses to one backslash and joins the next
-	// line, so the effective separator is not the default.
+func TestSmbConfSeparatorMismatchWithoutContinuation(t *testing.T) {
+	// A plain wrong separator is drift without the continuation hint.
 	staged := "[global]\n    winbind use default domain = no\n"
-	current := "[global]\n    winbind use default domain = no\n    winbind separator = \\\\\n    idmap config * : backend = tdb\n"
+	current := "[global]\n    winbind separator = +\n    winbind use default domain = no\n"
 	equal, key := smbConfSemanticallyEqual(staged, current)
 	if equal {
-		t.Fatalf("continuation-joined separator must be drift")
+		t.Fatal("a non-default separator must be drift")
 	}
 	if key != "global/winbind separator" {
 		t.Errorf("drift key = %q, want global/winbind separator", key)
+	}
+}
+
+func TestSmbMergePlanSeparatorHandling(t *testing.T) {
+	staged := "[global]\n    winbind use default domain = no\n" // default separator, omitted
+	for _, tc := range []struct {
+		name     string
+		current  string
+		conflict string
+	}{
+		{"omitted is not a conflict", "[global]\n    winbind use default domain = no\n", ""},
+		{"explicit non-default conflicts", "[global]\n    winbind separator = +\n", "winbind separator"},
+		{"continuation conflicts", "[global]\n    winbind separator = \\\\\n    winbind use default domain = no\n", "winbind separator"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, conflicts := smbMergePlan(staged, tc.current)
+			var got string
+			if len(conflicts) > 0 {
+				got = conflicts[0].Key
+			}
+			if got != tc.conflict {
+				t.Errorf("conflict = %q, want %q", got, tc.conflict)
+			}
+		})
+	}
+}
+
+func TestSmbMergePlanReportsEveryConflict(t *testing.T) {
+	staged := "[global]\n    realm = CORP.EXAMPLE.COM\n    workgroup = CORP\n"
+	current := "[global]\n    realm = OTHER.EXAMPLE.COM\n    workgroup = OTHER\n"
+	_, conflicts := smbMergePlan(staged, current)
+	if len(conflicts) != 2 {
+		t.Fatalf("conflicts = %#v, want 2", conflicts)
+	}
+	if conflicts[0].Key != "realm" || conflicts[1].Key != "workgroup" {
+		t.Errorf("conflict keys = %q, %q; want realm, workgroup", conflicts[0].Key, conflicts[1].Key)
+	}
+	if conflicts[0].Want != "CORP.EXAMPLE.COM" || conflicts[0].Current != "OTHER.EXAMPLE.COM" {
+		t.Errorf("conflict values = %#v", conflicts[0])
 	}
 }
 

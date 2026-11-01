@@ -26,7 +26,7 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 ### Scope
 - Implement file staging in `/tmp/rdpgw/` and mount safety checks (detecting read-only operator mounts).
 - Build the Go template engine using embedded templates (`smb.conf.tmpl`, `krb5.conf.tmpl`).
-- Implement the strict explode policy (`log.Fatalf`) if operator-mounted `smb.conf` files lack mandatory keytab synchronization directives.
+- Implement the strict explode policy (`log.Fatalf`) when the required generated `[global]` settings cannot be applied to an operator-mounted `smb.conf` (read-only volume, or a `[global]` section ending in a continuation backslash), or when an operator value differs from the generated one. Missing settings are appended; existing values are never overwritten, and drift terminates the daemon with an error naming every conflict.
 
 ### Deliverables
 - Embedded template assets in `cmd/auth/provisioning/templates/` (`smb.conf.tmpl`, `krb5.conf.tmpl`, embedded via `//go:embed templates/*.tmpl`).

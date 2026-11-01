@@ -210,11 +210,11 @@ func readOnlyFor(t *testing.T, target string, err error) func() {
 }
 
 func TestProvisionMergesIntoWritableOperatorFile(t *testing.T) {
-	// Writable target = merge: missing generated settings are added, the
-	// operator's own values are kept (with a drift warning when they differ).
+	// Writable target = merge: missing generated settings are added and the
+	// operator's own (non-conflicting) values are kept.
 	conf := modernWinbindConf(t)
 	p := optsFor(t)
-	preexisting := []byte("[global]\n    security = user\n    passdb backend = tdbsam\n")
+	preexisting := []byte("[global]\n    security = ads\n    passdb backend = tdbsam\n")
 	if err := os.WriteFile(p.SmbTarget, preexisting, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +224,7 @@ func TestProvisionMergesIntoWritableOperatorFile(t *testing.T) {
 	got := string(mustRead(t, p.SmbTarget))
 	for _, want := range []string{
 		"passdb backend = tdbsam", // operator setting preserved
-		"security = user",         // conflicting operator setting NOT replaced
+		"security = ads",          // already equal, not duplicated
 		"realm = CORP.EXAMPLE.COM",
 		"workgroup = CORP",
 		"dedicated keytab file = /var/lib/samba/rdpgw.keytab",
@@ -236,6 +236,90 @@ func TestProvisionMergesIntoWritableOperatorFile(t *testing.T) {
 	}
 	if strings.Count(got, "security =") != 1 {
 		t.Errorf("existing operator settings must not be duplicated:\n%s", got)
+	}
+}
+
+func TestProvisionMispointedKeytabExplodes(t *testing.T) {
+	// A writable operator file that points the keytab directives at the wrong
+	// path is never rewritten: provisioning fails and names every conflicting
+	// setting so the operator can fix the file.
+	conf := modernWinbindConf(t)
+	p := optsFor(t)
+	preexisting := []byte(`[global]
+    security = ads
+    realm = CORP.EXAMPLE.COM
+    workgroup = CORP
+    netbios name = rdpgw-auth
+    kerberos method = secrets only
+    dedicated keytab file = /etc/krb5.keytab
+    sync machine password to keytab = "/etc/krb5.keytab:sync_spns:sync_kvno:machine_password"
+
+[printers]
+    printable = yes
+`)
+	if err := os.WriteFile(p.SmbTarget, preexisting, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := mustRead(t, p.SmbTarget)
+
+	err := provision(conf, p)
+	if !errors.Is(err, ErrExplosion) {
+		t.Fatalf("conflicting operator values must explode, got %v", err)
+	}
+	for _, key := range []string{"kerberos method", "dedicated keytab file", "sync machine password to keytab"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("explosion must name the conflicting setting %q: %v", key, err)
+		}
+	}
+	for _, value := range []string{"secrets only", "/etc/krb5.keytab"} {
+		if !strings.Contains(err.Error(), value) {
+			t.Errorf("explosion must show the operator value %q: %v", value, err)
+		}
+	}
+	for _, want := range []string{
+		"generated: kerberos method = secrets and keytab",
+		"generated: dedicated keytab file = /var/lib/samba/rdpgw.keytab",
+		p.StageDir,
+		"or fix the rdpgw-auth configuration that produced it",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("explosion must show %q: %v", want, err)
+		}
+	}
+	if after := mustRead(t, p.SmbTarget); string(after) != string(before) {
+		t.Errorf("conflicting smb.conf must stay untouched:\n%s", after)
+	}
+}
+
+func TestProvisionContinuationKeytabDirectiveExplodes(t *testing.T) {
+	// A directive split by samba's line continuation is an operator value too:
+	// it is never rewritten, provisioning fails instead.
+	conf := modernWinbindConf(t)
+	p := optsFor(t)
+	preexisting := []byte("[global]\n" +
+		"    dedicated keytab file = \\\n" +
+		"        /etc/krb5.keytab\n" +
+		"    security = ads\n")
+	if err := os.WriteFile(p.SmbTarget, preexisting, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := mustRead(t, p.SmbTarget)
+
+	err := provision(conf, p)
+	if !errors.Is(err, ErrExplosion) {
+		t.Fatalf("conflicting continuation directive must explode, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "dedicated keytab file") {
+		t.Errorf("explosion must name the conflicting setting: %v", err)
+	}
+	if !strings.Contains(err.Error(), "generated: dedicated keytab file = /var/lib/samba/rdpgw.keytab") {
+		t.Errorf("explosion must show the generated setting: %v", err)
+	}
+	if !strings.Contains(err.Error(), p.StageDir) {
+		t.Errorf("explosion must point at the generated file: %v", err)
+	}
+	if after := mustRead(t, p.SmbTarget); string(after) != string(before) {
+		t.Errorf("conflicting smb.conf must stay untouched:\n%s", after)
 	}
 }
 
@@ -320,32 +404,79 @@ func TestProvisionReadOnlyEquivalentAccepted(t *testing.T) {
 	}
 }
 
-func TestProvisionReadOnlyDriftWarns(t *testing.T) {
-	// Read-only target that differs: the operator file wins and provisioning
-	// continues with an explicit warning (no fatal, no crashloop).
+func TestProvisionReadOnlyMissingSettingsExplodes(t *testing.T) {
+	// The required settings cannot be added to a read-only file: the daemon
+	// must not start half-configured. The error lists every setting it could
+	// not add.
 	conf := modernWinbindConf(t)
 	p := optsFor(t)
-	operator := []byte("[global]\n    security = user\n")
+	operator := []byte("[global]\n    security = ads\n")
 	if err := os.WriteFile(p.SmbTarget, operator, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
 	defer restore()
 
-	if err := provision(conf, p); err != nil {
-		t.Fatalf("drifted read-only smb.conf must only warn, got %v", err)
+	err := provision(conf, p)
+	if !errors.Is(err, ErrExplosion) {
+		t.Fatalf("read-only smb.conf missing required settings must explode, got %v", err)
 	}
-	body, _ := os.ReadFile(p.SmbTarget)
-	if string(body) != string(operator) {
+	for _, key := range []string{"realm", "workgroup", "dedicated keytab file"} {
+		if !strings.Contains(err.Error(), key) {
+			t.Errorf("explosion must list the settings it could not add, missing %q: %v", key, err)
+		}
+	}
+	for _, want := range []string{
+		"Generated configuration:",
+		`realm = CORP.EXAMPLE.COM`,
+		p.StageDir,
+		"or fix the rdpgw-auth configuration that produced them",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("explosion must show %q: %v", want, err)
+		}
+	}
+	if body, _ := os.ReadFile(p.SmbTarget); string(body) != string(operator) {
 		t.Errorf("read-only smb.conf must stay untouched:\n%s", body)
 	}
 }
 
-func TestProvisionReadOnlyContinuationDriftDetected(t *testing.T) {
+func TestProvisionWritableContinuationHazardExplodes(t *testing.T) {
+	// A [global] section whose last line ends in a backslash would swallow
+	// appended settings, so the required lines cannot be added safely. The
+	// hazardous line is an unmanaged operator setting, so it is not itself a
+	// conflict.
+	conf := legacyConf(t) // default backslash separator: no conflict
+	p := optsFor(t)
+	operator := []byte("[global]\n    security = ads\n    log file = /var/log/samba/log.\\\n")
+	if err := os.WriteFile(p.SmbTarget, operator, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := provision(conf, p)
+	if !errors.Is(err, ErrExplosion) {
+		t.Fatalf("continuation hazard must explode, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "continuation") {
+		t.Errorf("explosion must explain the continuation hazard: %v", err)
+	}
+	if !strings.Contains(err.Error(), "Generated configuration:") || !strings.Contains(err.Error(), p.StageDir) {
+		t.Errorf("explosion must point at the generated file: %v", err)
+	}
+	if !strings.Contains(err.Error(), "realm = CORP") {
+		t.Errorf("explosion must list the settings it could not add: %v", err)
+	}
+	if body, _ := os.ReadFile(p.SmbTarget); string(body) != string(operator) {
+		t.Errorf("hazardous smb.conf must stay untouched:\n%s", body)
+	}
+}
+
+func TestProvisionContinuationSeparatorDriftExplodes(t *testing.T) {
 	// The real-world deployment shape: an operator copy of the generated file
 	// with 'winbind separator = \\' — the continuation joins the next line
 	// into the value, so it is NOT semantically equal even though it looks
-	// like the default at a glance.
+	// like the default at a glance. A differing operator value is a hard
+	// failure, even on a read-only target.
 	conf := legacyConf(t) // default backslash separator => directive omitted
 	p := optsFor(t)
 	stagedBody := string(mustRead(t, mustStageSmb(t, conf)))
@@ -367,8 +498,18 @@ func TestProvisionReadOnlyContinuationDriftDetected(t *testing.T) {
 	}
 	restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
 	defer restore()
-	if err := provision(conf, p); err != nil {
-		t.Fatalf("drift must warn, not fail: %v", err)
+	err := provision(conf, p)
+	if !errors.Is(err, ErrExplosion) {
+		t.Fatalf("drifted read-only smb.conf must explode, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "winbind separator") {
+		t.Errorf("explosion must name the conflicting separator: %v", err)
+	}
+	if !strings.Contains(err.Error(), "generated: winbind separator = \\") {
+		t.Errorf("explosion must show the generated separator: %v", err)
+	}
+	if !strings.Contains(err.Error(), p.StageDir) {
+		t.Errorf("explosion must point at the generated file: %v", err)
 	}
 }
 

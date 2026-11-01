@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"text/template"
 	"unicode"
 
@@ -33,10 +32,11 @@ type provisionOptions struct {
 	Krb5Target string
 }
 
-// ErrExplosion is returned when a required target file does not exist and
-// cannot be created (read-only parent, no permissions): the daemon refuses
-// to start without the configuration files it depends on.
-var ErrExplosion = errors.New("rdpgw-auth: required configuration file is missing and cannot be created")
+// ErrExplosion marks provisioning failures that must abort startup because the
+// generated configuration cannot be applied without operator action: a missing
+// target that cannot be created, a required setting that cannot be added, or
+// an operator value that differs from the generated one.
+var ErrExplosion = errors.New("operator action required")
 
 // smbTemplateData carries the fields rendered into smb.conf.tmpl. Realm is
 // the FQDN of the domain (winbind.Domain), falling back to the NetBIOS
@@ -72,10 +72,12 @@ type krb5TemplateData struct {
 // any winbind capability (no Kerberos keytab share and no winbind NTLM
 // backend) skip provisioning entirely.
 //
-// An operator-managed smb.conf on a read-only volume that lacks the
-// mandatory keytab directives terminates the daemon via log.Fatalf: the
-// gateway must never run half-configured against the domain (strict
-// explode policy of the operations plan, Milestone 2).
+// An operator-managed smb.conf that cannot receive the generated settings it
+// is missing (read-only volume, or a [global] section ending in a continuation
+// backslash) terminates the daemon via log.Fatalf: the gateway must never run
+// half-configured against the domain (strict explode policy of the operations
+// plan, Milestone 2). Existing operator values are never replaced: drift
+// terminates the daemon with an error naming every conflicting setting.
 func Provision(conf config.Configuration) error {
 	if !UsesWinbind(conf) {
 		log.Printf("Provisioning: no Kerberos keytab share and no winbind NTLM backend enabled, skipping smb.conf/krb5.conf provisioning")
@@ -259,14 +261,16 @@ func stageTemplate(name string, data interface{}, stageDir string) (string, erro
 //
 //  1. target missing: write the staged file — if that is impossible the
 //     daemon refuses to start (ErrExplosion), because the file is required;
-//  2. target present: try to merge the generated settings into it (smb) or
-//     overwrite it (krb5) when writable;
-//  3. merge/overwrite succeeded: done — existing operator settings are kept,
-//     missing managed settings are added, nothing is replaced;
-//  4. target not writable: accept when it is semantically equal to the
-//     generated configuration;
-//  5. otherwise warn that the operator setting wins and expected features
-//     (Kerberos/winbind authentication) may fail until reconciled.
+//  2. smb.conf present: append the generated settings it lacks, but never
+//     replace an existing operator value. A key whose value differs is a
+//     hard failure (ErrExplosion naming every conflict);
+//  3. required settings cannot be added (read-only target, or a [global]
+//     section ending in a continuation backslash): the daemon refuses to
+//     start, because it would run half-configured;
+//  4. krb5.conf present: overwrite it when writable;
+//  5. target not writable: accept when it is semantically equal to the
+//     generated configuration, otherwise warn that the operator file wins and
+//     expected features may fail until reconciled.
 func reconcile(staged, target string, merge bool, semanticallyEqual func(staged, current string) (bool, string)) error {
 	stagedContent, err := os.ReadFile(staged)
 	if err != nil {
@@ -288,28 +292,21 @@ func reconcile(staged, target string, merge bool, semanticallyEqual func(staged,
 	}
 
 	if merge {
-		_, changedKeys, conflict, mergeErr := mergeSmbConf(target, string(stagedContent), string(current))
-		if mergeErr == nil {
-			if len(changedKeys) > 0 {
-				log.Printf("Provisioning: merged missing settings into %s: %v", target, changedKeys)
-			} else {
-				log.Printf("Provisioning: %s already carries all generated settings", target)
-			}
-			if conflict != "" {
-				log.Printf("WARNING: %s keeps its own value for %q (not replaced). "+
-					"The operator setting wins; expected features such as Kerberos/winbind "+
-					"authentication may fail until it matches the generated configuration.", target, conflict)
-			}
-			return nil
+		addedKeys, mergeErr := mergeSmbConf(target, staged, string(stagedContent), string(current))
+		if mergeErr != nil {
+			return mergeErr
 		}
-		if !isReadOnlyFS(mergeErr) {
-			return fmt.Errorf("provisioning: cannot merge into %s: %w", target, mergeErr)
+		if len(addedKeys) > 0 {
+			log.Printf("Provisioning: merged missing settings into %s: %v", target, addedKeys)
+		} else {
+			log.Printf("Provisioning: %s already carries all generated settings", target)
 		}
-	} else {
-		if err := writeStagedFile(target, stagedContent, 0o644); err == nil {
-			log.Printf("Provisioning: wrote %s", target)
-			return nil
-		}
+		return nil
+	}
+
+	if err := writeStagedFile(target, stagedContent, 0o644); err == nil {
+		log.Printf("Provisioning: wrote %s", target)
+		return nil
 	}
 
 	if equal, key := semanticallyEqual(string(stagedContent), string(current)); equal {
@@ -323,31 +320,74 @@ func reconcile(staged, target string, merge bool, semanticallyEqual func(staged,
 	}
 }
 
+// smbConflictError builds the explosion for operator values that differ from
+// the generated ones. It shows the generated setting next to the operator
+// value and points at the staged file, so the operator can reconcile the file.
+func smbConflictError(target, stagedPath string, conflicts []smbConflict) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s has operator settings that differ from the generated configuration:", target)
+	for _, c := range conflicts {
+		fmt.Fprintf(&b, "\n  %s = %q\n  generated: %s", c.Key, c.Current, c.Line)
+	}
+	fmt.Fprintf(&b, "\nExisting operator values are never overwritten.\n"+
+		"To fix, update %s so it matches the generated configuration (%s), "+
+		"or fix the rdpgw-auth configuration that produced it. Then restart.", target, stagedPath)
+	return fmt.Errorf("%w: %s", ErrExplosion, b.String())
+}
+
+// missingSettingsError builds the explosion for required settings that could
+// not be added, listing every generated line the operator file is missing and
+// where the full generated file lives.
+func missingSettingsError(target, stagedPath, reason string, missing []string) error {
+	var b strings.Builder
+	fmt.Fprintf(&b, "cannot add the required settings to %s (%s):", target, reason)
+	for _, line := range missing {
+		fmt.Fprintf(&b, "\n  %s", line)
+	}
+	fmt.Fprintf(&b, "\nGenerated configuration: %s\n"+
+		"To fix, remove the obstacle above so these settings can be added, "+
+		"or fix the rdpgw-auth configuration that produced them. Then restart.", stagedPath)
+	return fmt.Errorf("%w: %s", ErrExplosion, b.String())
+}
+
 // mergeSmbConf adds the generated settings that the operator file does not
-// carry yet, inside [global], and reports which were added plus the first
-// operator setting that conflicts with the generated value (conflicts are
-// reported but never replaced). A [global] section whose last line ends in a
-// backslash is treated as a conflict and left alone: the parser would join
-// any appended line into that value.
-func mergeSmbConf(target, staged, current string) (merged bool, addedKeys []string, conflict string, err error) {
-	missing, conflict, hazard := smbMergePlan(staged, current)
-	if hazard {
-		return false, nil, "winbind separator (trailing backslash would swallow appended settings)", nil
+// carry yet, inside [global]. Existing operator values are never replaced.
+// Anything that prevents the generated configuration from being complete — a
+// conflicting operator value, a read-only target, or a [global] section
+// ending in a continuation backslash — is an ErrExplosion naming every
+// offending setting and the generated file: the daemon must not run
+// half-configured.
+func mergeSmbConf(target, stagedPath, staged, current string) (addedKeys []string, err error) {
+	missing, conflicts := smbMergePlan(staged, current)
+	if len(conflicts) > 0 {
+		return nil, smbConflictError(target, stagedPath, conflicts)
 	}
 	if len(missing) == 0 {
-		return false, nil, conflict, nil
+		return nil, nil
 	}
+
+	if smbGlobalEndsWithBackslash(current) {
+		return nil, missingSettingsError(target, stagedPath,
+			"the last [global] line ends with a backslash continuation, which would swallow them", missing)
+	}
+
 	updated := insertAtGlobalEnd(current, missing)
 	if err := writeStagedFile(target, []byte(updated), 0o644); err != nil {
-		return false, nil, "", err
+		return nil, missingSettingsError(target, stagedPath, err.Error(), missing)
 	}
-	for _, line := range missing {
+	return settingKeys(missing), nil
+}
+
+// settingKeys returns the lower-cased keys of the given "key = value" lines.
+func settingKeys(lines []string) []string {
+	keys := make([]string, 0, len(lines))
+	for _, line := range lines {
 		eq := strings.Index(line, "=")
 		if eq > 0 {
-			addedKeys = append(addedKeys, strings.ToLower(strings.TrimSpace(line[:eq])))
+			keys = append(keys, strings.ToLower(strings.TrimSpace(line[:eq])))
 		}
 	}
-	return true, addedKeys, conflict, nil
+	return keys
 }
 
 // insertAtGlobalEnd places the given setting lines at the end of the
@@ -402,12 +442,6 @@ func insertAtGlobalEnd(content string, lines []string) string {
 		b.WriteString(kept[i])
 	}
 	return b.String()
-}
-
-// isReadOnlyFS reports the platform's "read-only file system" failures,
-// including wrapped ones.
-func isReadOnlyFS(err error) bool {
-	return errors.Is(err, syscall.EROFS)
 }
 
 // writeStagedFile is swappable in tests so read-only mounts can be simulated

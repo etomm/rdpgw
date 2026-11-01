@@ -40,17 +40,25 @@ func wantOr(value, fallback string) string {
 	return value
 }
 
-// smbMergePlan returns the generated [global] settings whose key is absent
-// from the current file, the first conflicting operator setting (reported,
-// never replaced), and hazard=true when the last [global] line ends with a
-// backslash: appending there would be swallowed into that value by samba's
-// line continuation.
-func smbMergePlan(staged, current string) (missing []string, conflict string, hazard bool) {
-	if smbGlobalEndsWithBackslash(current) {
-		return nil, "winbind separator (trailing backslash would swallow appended settings)", true
-	}
+// smbConflict is a generated [global] setting that the operator file already
+// defines with a different value. The operator value wins: it is reported,
+// never replaced.
+type smbConflict struct {
+	Key     string
+	Current string
+	Want    string
+	// Line is the generated setting as it appears in the staged smb.conf.
+	Line string
+}
 
+// smbMergePlan returns the generated [global] settings whose key is absent
+// from the current file and the settings the operator defined differently.
+// Nothing is ever replaced: the caller decides whether a conflict is a warning
+// or a hard failure.
+func smbMergePlan(staged, current string) (missing []string, conflicts []smbConflict) {
+	stagedSettings := parseSmbConf(staged)
 	currentSettings := parseSmbConf(current)
+
 	for _, line := range smbGlobalLines(staged) {
 		eq := strings.Index(line, "=")
 		if eq <= 0 {
@@ -65,24 +73,27 @@ func smbMergePlan(staged, current string) (missing []string, conflict string, ha
 			missing = append(missing, line)
 			continue
 		}
-		if conflict == "" && normalizeSmbValue(full, currentValue) != normalizeSmbValue(full, value) {
-			conflict = key
+		if normalizeSmbValue(full, currentValue) != normalizeSmbValue(full, value) {
+			conflicts = append(conflicts, smbConflict{Key: key, Current: currentValue, Want: value, Line: line})
 		}
 	}
 
-	// The generated file may express the default backslash separator by
-	// omitting the directive; any operator value that differs from the
-	// generated one is a conflict.
-	desiredSeparator := `\`
-	if v, present := parseSmbConf(staged)["global/winbind separator"]; present {
-		desiredSeparator = v
+	// The separator is always-present (omitted = samba's backslash default).
+	// When the staged file omits the directive, only an explicitly written
+	// operator line can conflict; a directive the staged file writes is
+	// already compared above.
+	if _, stagedWritesSeparator := stagedSettings["global/winbind separator"]; !stagedWritesSeparator {
+		if v, present := currentSettings["global/winbind separator"]; present &&
+			normalizeSmbValue("global/winbind separator", v) != normalizeSmbValue("global/winbind separator", `\`) {
+			conflicts = append(conflicts, smbConflict{
+				Key:     "winbind separator",
+				Current: v,
+				Want:    `\`,
+				Line:    `winbind separator = \ (samba default, omitted from the generated file)`,
+			})
+		}
 	}
-	if v, present := currentSettings["global/winbind separator"]; present &&
-		normalizeSmbValue("global/winbind separator", v) != normalizeSmbValue("global/winbind separator", desiredSeparator) &&
-		conflict == "" {
-		conflict = "winbind separator"
-	}
-	return missing, conflict, false
+	return missing, conflicts
 }
 
 // smbGlobalLines extracts the settable lines (no comments/blanks/section
