@@ -207,8 +207,7 @@ from list tokenization, not from a generic quote-stripping pass.
 
 ## 6. Template-specific rules and known issues
 
-Template: `cmd/auth/templates/smb.conf.tmpl` (mirrored at
-`docs/specs/smb.conf.tmpl`).
+Template: `cmd/auth/templates/smb.conf.tmpl`.
 
 | Field | Type | Rule for the template |
 |---|---|---|

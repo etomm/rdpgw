@@ -44,7 +44,7 @@ Before joining domains or generating keytabs, ensure `/etc/krb5.conf` is properl
     your.realm = YOUR.REALM
 ```
 
-> 💡 **Multiple KDCs / Domain Controllers**: If you need to specify multiple KDC or administration servers for redundancy, you can repeat the `kdc` and `admin_server` entries within the realm block.
+> 💡 **Multiple KDCs / Domain Controllers**: If you need to specify multiple KDC or administration servers for redundancy, you can repeat the `kdc` and `admin_server` entries within the realm block. With a winbind-capable `rdpgw-auth`, list them under `Winbind.domaincontrollers` instead and they end up in the generated file.
 
 ### 2. Domain Join & Service Principal Creation
 

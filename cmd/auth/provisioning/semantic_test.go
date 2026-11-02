@@ -96,14 +96,14 @@ func TestSmbMergePlanSeparatorHandling(t *testing.T) {
 		conflict string
 	}{
 		{"omitted is not a conflict", "[global]\n    winbind use default domain = no\n", ""},
-		{"explicit non-default conflicts", "[global]\n    winbind separator = +\n", "winbind separator"},
-		{"continuation conflicts", "[global]\n    winbind separator = \\\\\n    winbind use default domain = no\n", "winbind separator"},
+		{"explicit non-default conflicts", "[global]\n    winbind separator = +\n", "global/winbind separator"},
+		{"continuation conflicts", "[global]\n    winbind separator = \\\\\n    winbind use default domain = no\n", "global/winbind separator"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			_, conflicts := smbMergePlan(staged, tc.current)
+			plan := smbMergePlan(staged, tc.current)
 			var got string
-			if len(conflicts) > 0 {
-				got = conflicts[0].Key
+			if len(plan.conflicts) > 0 {
+				got = plan.conflicts[0].Key
 			}
 			if got != tc.conflict {
 				t.Errorf("conflict = %q, want %q", got, tc.conflict)
@@ -115,11 +115,12 @@ func TestSmbMergePlanSeparatorHandling(t *testing.T) {
 func TestSmbMergePlanReportsEveryConflict(t *testing.T) {
 	staged := "[global]\n    realm = CORP.EXAMPLE.COM\n    workgroup = CORP\n"
 	current := "[global]\n    realm = OTHER.EXAMPLE.COM\n    workgroup = OTHER\n"
-	_, conflicts := smbMergePlan(staged, current)
+	plan := smbMergePlan(staged, current)
+	conflicts := plan.conflicts
 	if len(conflicts) != 2 {
 		t.Fatalf("conflicts = %#v, want 2", conflicts)
 	}
-	if conflicts[0].Key != "realm" || conflicts[1].Key != "workgroup" {
+	if conflicts[0].Key != "global/realm" || conflicts[1].Key != "global/workgroup" {
 		t.Errorf("conflict keys = %q, %q; want realm, workgroup", conflicts[0].Key, conflicts[1].Key)
 	}
 	if conflicts[0].Want != "CORP.EXAMPLE.COM" || conflicts[0].Current != "OTHER.EXAMPLE.COM" {
@@ -138,111 +139,5 @@ func TestSmbConfSeparatorDefaultAccepted(t *testing.T) {
 	equal, key := smbConfSemanticallyEqual(staged, current)
 	if equal || key != "global/winbind use default domain" {
 		t.Fatalf("equal=%v key=%q, want drift on winbind use default domain", equal, key)
-	}
-}
-
-func TestKrb5ConfSemanticallyEqual(t *testing.T) {
-	staged := `[libdefaults]
-    default_realm = CORP.EXAMPLE.COM
-    dns_lookup_kdc = true
-
-[realms]
-    CORP.EXAMPLE.COM = {
-        kdc = dc1.example.com:88
-        kdc = dc2.example.com:88
-        admin_server = dc1.example.com:749
-    }
-
-[domain_realm]
-    .example.com = CORP.EXAMPLE.COM
-`
-
-	cases := []struct {
-		name    string
-		current string
-		equal   bool
-	}{
-		{
-			name: "same settings different formatting and order",
-			current: `# operator krb5
-[libdefaults]
-    dns_lookup_kdc = true
-    default_realm = CORP.EXAMPLE.COM
-
-[realms]
-    corp.example.com = {
-        admin_server = dc1.example.com:749
-        kdc = dc2.example.com:88
-        kdc = dc1.example.com:88
-    }
-
-[domain_realm]
-    .example.com = CORP.EXAMPLE.COM
-`,
-			equal: true,
-		},
-		{
-			name: "extra operator settings are ignored",
-			current: `[libdefaults]
-    default_realm = CORP.EXAMPLE.COM
-    dns_lookup_kdc = true
-    dns_lookup_realm = true
-    forwardable = true
-
-[realms]
-    CORP.EXAMPLE.COM = {
-        kdc = dc1.example.com:88
-        kdc = dc2.example.com:88
-        admin_server = dc1.example.com:749
-    }
-
-[domain_realm]
-    .example.com = CORP.EXAMPLE.COM
-`,
-			equal: true,
-		},
-		{
-			name: "missing kdc is drift",
-			current: `[libdefaults]
-    default_realm = CORP.EXAMPLE.COM
-    dns_lookup_kdc = true
-
-[realms]
-    CORP.EXAMPLE.COM = {
-        kdc = dc1.example.com:88
-        admin_server = dc1.example.com:749
-    }
-
-[domain_realm]
-    .example.com = CORP.EXAMPLE.COM
-`,
-			equal: false,
-		},
-		{
-			name: "different realm is drift",
-			current: `[libdefaults]
-    default_realm = OTHER.EXAMPLE.COM
-    dns_lookup_kdc = true
-
-[realms]
-    OTHER.EXAMPLE.COM = {
-        kdc = dc1.example.com:88
-        kdc = dc2.example.com:88
-        admin_server = dc1.example.com:749
-    }
-
-[domain_realm]
-    .example.com = OTHER.EXAMPLE.COM
-`,
-			equal: false,
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			equal, _ := krb5ConfSemanticallyEqual(staged, tc.current)
-			if equal != tc.equal {
-				t.Errorf("equal = %v, want %v", equal, tc.equal)
-			}
-		})
 	}
 }

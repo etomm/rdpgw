@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+### Provisioning drift (`--relaxed`) and the krb5.conf merge
+
+When the configuration has winbind capability, `rdpgw-auth` reconciles
+`smb.conf` and `/etc/krb5.conf` against the generated settings before
+joining:
+
+* a writable target gets the generated settings it lacks **appended**
+  (inside `[global]` for smb.conf; for krb5.conf single relations go inside
+  their section and a missing realm block is appended as one collected
+  `{ ... }` unit); existing operator values are **never overwritten**;
+* a setting the operator defined differently is drift: with the default
+  strict policy (for `smb.conf` and `krb5.conf` alike) this stops the
+  daemon - the error names every conflicting setting;
+* settings that cannot be appended (a read-only target, or a `[global]`
+  section ending in a continuation backslash) also stop the daemon in
+  strict mode; a read-only file that already carries everything is accepted
+  without writing;
+* with **`--relaxed`** all of the above drift becomes a warning instead of an
+  exit - the daemon keeps running and logs exactly what differs. Operator
+  values stay untouched in every mode.
+
+`krb5.conf` is no longer regenerated wholesale when writable: its merge
+treats each `[realms]` block as one value (realm names must be upper case; a
+case-only difference is drift, never a duplicate block). See
+[docs/configuration-provisioning.md](docs/configuration-provisioning.md).
+
 ### Container image no longer bakes a TLS cert and runs as UID 1001
 
 Two changes to `dev/docker/Dockerfile` and the dev image's entrypoint:

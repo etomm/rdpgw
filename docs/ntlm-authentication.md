@@ -230,8 +230,12 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-With the winbind backend, start the helper after winbind and grant access to the
-privileged pipe:
+With the winbind backend on a classic domain-joined host, run a system
+`winbindd` service (`systemctl enable --now winbind`) and give the helper
+access to winbind's privileged pipe. The daemon is also told to delegate
+winbindd to the host and to treat file drift as a loud warning (systemd
+services should keep running instead of stopping over an operator-owned
+file) with `--relaxed`:
 
 ```ini
 [Unit]
@@ -239,6 +243,8 @@ After=network.target winbind.service
 Wants=winbind.service
 
 [Service]
+Environment=RDPGW_AUTH_EXTERNAL_WINBIND=1
+ExecStart=/usr/local/bin/rdpgw-auth -c /etc/rdpgw-auth.yaml --relaxed
 SupplementaryGroups=winbindd_priv
 ```
 
@@ -354,8 +360,12 @@ spec:
   Domain join state (/var/lib/samba/private/secrets.tdb) not found.
   Waiting for manual domain join (exec into the container and run: net ads join -U Administrator)...
   ```
-  You can exec into the container and run `net ads join -U Administrator` manually. As soon as the join completes, the startup script automatically detects `secrets.tdb` and starts `winbindd` and `rdpgw-auth`.
-- **Persistent Trust**: Because `/var/lib/samba` is mounted on a persistent volume, domain join is a one-time operation. Pod restarts will automatically detect the existing join state and start immediately without re-joining.
+  You can exec into the container and run `net ads join -U Administrator`
+  manually. As soon as the join is detected, `rdpgw-auth` continues: keytab
+  refresh, SPN registration/verification, `winbindd` supervision and the
+  gRPC server follow. If the budget expires without a join, the daemon exits
+  with a remediation playbook.
+- **Persistent Trust**: Because `/var/lib/samba` is mounted on a persistent volume, domain join is a one-time operation. Pod restarts will automatically detect the existing join state (`net ads testjoin`) and start immediately without re-joining.
 
 ## Client Configuration
 

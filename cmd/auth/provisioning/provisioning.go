@@ -32,6 +32,12 @@ type Options struct {
 	// winbindd and "net ads join" expect. Leave it false when the host
 	// provides winbindd and owns that state.
 	ManagedWinbind bool
+	// Relaxed downgrades provisioning drift in operator-managed files from
+	// fatal to warnings: conflicts and settings that cannot be applied are
+	// logged and the daemon keeps running. Operator values are never
+	// replaced in either mode. Strict (the default) refuses to start
+	// instead, so container deployments catch drift at deploy time.
+	Relaxed bool
 }
 
 // provisionOptions parameterizes the filesystem locations so the provisioner
@@ -106,13 +112,21 @@ type krb5TemplateData struct {
 // is missing (read-only volume, or a [global] section ending in a continuation
 // backslash) terminates the daemon via log.Fatalf: the gateway must never run
 // half-configured against the domain (strict explode policy of the operations
-// plan, Milestone 2). Existing operator values are never replaced: drift
-// terminates the daemon with an error naming every conflicting setting.
+// plan, Milestone 2). Existing operator values are never replaced: drift fails
+// the daemon with an error naming every conflicting setting, or — with
+// Options.Relaxed — only logs a warning, so long systemd deployments keep
+// running. The generated configuration then lives in the staging directory and
+// is what the operator file should be reconciled against.
 func Provision(conf config.Configuration, opts Options) error {
 	return provisionWith(conf, opts, provisionOptions{})
 }
 
 // provisionWith is Provision with injectable filesystem locations for tests.
+// It is the single entry that actually provisions, so it also owns the
+// validation contract: provisioning consumes normalized values (derived
+// workgroup, default keytab path, validated domain/DC list), and a caller
+// that bypasses config.Load must not be able to render an incoherent
+// smb.conf/krb5.conf.
 func provisionWith(conf config.Configuration, opts Options, p provisionOptions) error {
 	if !UsesWinbind(conf) {
 		log.Printf("Provisioning: no Kerberos keytab share and no winbind NTLM backend enabled, skipping smb.conf/krb5.conf provisioning")
@@ -123,10 +137,12 @@ func provisionWith(conf config.Configuration, opts Options, p provisionOptions) 
 		// every winbind-capable deployment); guarded for direct callers.
 		return fmt.Errorf("provisioning: winbind capability requested but the Winbind configuration block is missing")
 	}
+	// Validate only after establishing that this deployment actually needs
+	// provisioning: a non-winbind config must remain a no-op.
 	if err := conf.Validate(); err != nil {
 		return fmt.Errorf("provisioning: invalid configuration: %w", err)
 	}
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, opts.Relaxed); err != nil {
 		return err
 	}
 	if !opts.ManagedWinbind {
@@ -137,7 +153,8 @@ func provisionWith(conf config.Configuration, opts Options, p provisionOptions) 
 }
 
 // UsesWinbind reports whether the deployment needs Samba/Kerberos files at
-// all: either the Kerberos keytab share or a winbind NTLM backend is on.
+// all: either the Kerberos keytab share, or a winbind verifier in the NTLM or
+// Basic stack.
 func UsesWinbind(conf config.Configuration) bool {
 	if conf.AuthProtocols == nil {
 		return false
@@ -152,10 +169,17 @@ func UsesWinbind(conf config.Configuration) bool {
 			}
 		}
 	}
+	if basic := conf.AuthProtocols.Basic; basic != nil && basic.Enabled {
+		for _, entry := range basic.Stack {
+			if strings.EqualFold(entry.Backend, config.BasicBackendWinbind) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
-func provision(conf config.Configuration, p provisionOptions) error {
+func provision(conf config.Configuration, p provisionOptions, relaxed bool) error {
 	p = p.withDefaults()
 	if err := os.MkdirAll(p.StageDir, 0o700); err != nil {
 		return fmt.Errorf("provisioning: cannot create staging dir %s: %w", p.StageDir, err)
@@ -165,7 +189,10 @@ func provision(conf config.Configuration, p provisionOptions) error {
 	if err != nil {
 		return err
 	}
-	krb5Data := buildKrb5Data(conf)
+	krb5Data, err := buildKrb5Data(conf)
+	if err != nil {
+		return err
+	}
 
 	smbStaged, err := stageTemplate("smb.conf.tmpl", smbData, p.StageDir)
 	if err != nil {
@@ -177,10 +204,10 @@ func provision(conf config.Configuration, p provisionOptions) error {
 	}
 	log.Printf("Provisioning: staged configuration under %s (smb.conf, krb5.conf)", p.StageDir)
 
-	if err := reconcile(smbStaged, p.SmbTarget, true, smbConfSemanticallyEqual); err != nil {
+	if err := reconcileSmb(smbStaged, p.SmbTarget, relaxed); err != nil {
 		return err
 	}
-	if err := reconcile(krb5Staged, p.Krb5Target, false, krb5ConfSemanticallyEqual); err != nil {
+	if err := reconcileKrb5(krb5Staged, p.Krb5Target, relaxed); err != nil {
 		return err
 	}
 	return publishSharedKrb5(conf, p)
@@ -265,16 +292,21 @@ func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
-// buildSmbData fills the smb.conf template view model from any schema
-// shape: with the legacy workgroup shorthand the realm falls back to the
-// NetBIOS name so net ads can still discover the real FQDN via DNS.
+// buildSmbData fills the smb.conf template view model from the normalized
+// configuration. Winbind.Domain is the DNS/Kerberos realm; it is never
+// substituted with the NetBIOS workgroup (that would produce an invalid AD
+// realm).
 func buildSmbData(conf config.Configuration) (smbTemplateData, error) {
 	kerberos := conf.AuthProtocols.Kerberos
 	keytabSharing := kerberos != nil && kerberos.Share
 	keytabPath := ""
 	if keytabSharing {
+		// config.Load applies DefaultSharedKeytab and config.Validate
+		// requires the path for a keytab share; provisioning does not
+		// repeat those configuration rules.
 		keytabPath = kerberos.KeytabPath
 	}
+
 	data := smbTemplateData{
 		// Samba's `realm` is the kerberos realm; AD issues tickets with the
 		// upper-case realm, so normalize it (same as krb5.conf).
@@ -286,9 +318,6 @@ func buildSmbData(conf config.Configuration) (smbTemplateData, error) {
 		Workgroup:     conf.Winbind.Workgroup,
 		KerberosShare: keytabSharing,
 		KeytabPath:    keytabPath,
-	}
-	if data.Realm == "" {
-		data.Realm = strings.ToUpper(data.Workgroup)
 	}
 
 	// Format the separator for the smb.conf parser:
@@ -347,16 +376,43 @@ func containsControlRune(value string) bool {
 // upper-case realm), so Realm is normalized to upper case while Domain keeps
 // the operator's spelling for the [domain_realm] lookups, which are DNS
 // domain names and conventionally lower case.
-func buildKrb5Data(conf config.Configuration) krb5TemplateData {
+//
+// Values are validated against the krb5.conf parser grammar: unlike smb.conf
+// there is no line continuation and no quoting, but relations can open
+// subsections with a trailing `{` and comments start with `#`/`;` — so any
+// value carrying a brace (or a newline/control character) would corrupt the
+// file structure and is rejected. See docs/configuration-provisioning.md.
+func buildKrb5Data(conf config.Configuration) (krb5TemplateData, error) {
 	domain := conf.Winbind.Domain
-	if domain == "" {
-		domain = conf.Winbind.Workgroup
-	}
-	return krb5TemplateData{
+	data := krb5TemplateData{
 		Realm:             strings.ToUpper(domain),
 		Domain:            domain,
 		DomainControllers: conf.Winbind.DomainControllers,
 	}
+
+	// Realm/Domain are rendered both as section tags and block headers
+	// (`REALM = {`), where a `{`, `}` or control character would break the
+	// brace structure; the KDC hosts are rendered inline in relations, where
+	// a newline or control character would swallow the rest of the line.
+	for _, v := range []struct{ name, value string }{
+		{"winbind.domain", data.Realm},
+		{"winbind.domain", data.Domain},
+	} {
+		if strings.ContainsAny(v.value, "{}\r\n") || containsControlRune(v.value) {
+			return krb5TemplateData{}, fmt.Errorf(
+				"provisioning: %s %q contains a brace, newline or control character and cannot be written to krb5.conf", v.name, v.value)
+		}
+	}
+	for i, dc := range data.DomainControllers {
+		// The "host must be set" rule is operator-input validation and lives
+		// in config.Validate; this loop only enforces the krb5.conf file
+		// grammar (a brace/newline would corrupt the rendered structure).
+		if strings.ContainsAny(dc.Host, "{}\r\n") || containsControlRune(dc.Host) {
+			return krb5TemplateData{}, fmt.Errorf(
+				"provisioning: winbind.domainControllers[%d] %q contains a brace, newline or control character and cannot be written to krb5.conf", i, dc.Host)
+		}
+	}
+	return data, nil
 }
 
 // stageTemplate renders one embedded template into the staging directory
@@ -381,125 +437,222 @@ func stageTemplate(name string, data interface{}, stageDir string) (string, erro
 	return staged, nil
 }
 
-// reconcile applies the uniform provisioning policy to one target file:
+// reconciler applies the uniform provisioning policy to one target file:
 //
 //  1. target missing: write the staged file — if that is impossible the
 //     daemon refuses to start (ErrExplosion), because the file is required;
-//  2. smb.conf present: append the generated settings it lacks, but never
-//     replace an existing operator value. A key whose value differs is a
-//     hard failure (ErrExplosion naming every conflict);
-//  3. required settings cannot be added (read-only target, or a [global]
-//     section ending in a continuation backslash): the daemon refuses to
-//     start, because it would run half-configured;
-//  4. krb5.conf present: overwrite it when writable;
-//  5. target not writable: accept when it is semantically equal to the
-//     generated configuration, otherwise warn that the operator file wins and
-//     expected features may fail until reconciled.
-func reconcile(staged, target string, merge bool, semanticallyEqual func(staged, current string) (bool, string)) error {
-	stagedContent, err := os.ReadFile(staged)
-	if err != nil {
-		return fmt.Errorf("provisioning: cannot read staged %s: %w", staged, err)
-	}
+//  2. file present: merge the generated settings it lacks, but never replace
+//     an existing operator value;
+//  3. a setting the operator defined differently from the generated one:
+//     strict mode fails the daemon naming every conflict, relaxed mode only
+//     warns (the merge still applies the missing settings);
+//  4. required settings that cannot be added (read-only target, or a [global]
+//     section ending in a continuation backslash): strict fails the daemon,
+//     relaxed warns that the operator file wins and expected features may
+//     fail until reconciled;
+//  5. when nothing can be written at all, accept a semantically equal target;
+//     otherwise warn that the operator file wins.
+//
+// The validators report drift through the shared error/warning helper.
+type reconciler struct {
+	target  string
+	staged  string
+	relaxed bool
 
-	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
-		if err := writeStagedFile(target, stagedContent, 0o644); err != nil {
-			return fmt.Errorf("%w: %s does not exist and cannot be created (%v): "+
-				"provide the file or a writable location for it", ErrExplosion, target, err)
-		}
-		log.Printf("Provisioning: installed %s", target)
-		return nil
-	}
-
-	current, err := os.ReadFile(target)
-	if err != nil {
-		return fmt.Errorf("provisioning: cannot read %s: %w", target, err)
-	}
-
-	if merge {
-		addedKeys, mergeErr := mergeSmbConf(target, staged, string(stagedContent), string(current))
-		if mergeErr != nil {
-			return mergeErr
-		}
-		if len(addedKeys) > 0 {
-			log.Printf("Provisioning: merged missing settings into %s: %v", target, addedKeys)
-		} else {
-			log.Printf("Provisioning: %s already carries all generated settings", target)
-		}
-		return nil
-	}
-
-	if err := writeStagedFile(target, stagedContent, 0o644); err == nil {
-		log.Printf("Provisioning: wrote %s", target)
-		return nil
-	}
-
-	if equal, key := semanticallyEqual(string(stagedContent), string(current)); equal {
-		log.Printf("Provisioning: %s is read-only but semantically identical to the generated configuration", target)
-		return nil
-	} else {
-		log.Printf("WARNING: %s is not writable and differs from the generated configuration (%s). "+
-			"The operator-managed file wins; expected features such as Kerberos/winbind authentication "+
-			"may fail until it matches.", target, describeDrift(target, key))
-		return nil
-	}
+	stagedContent  string
+	currentContent string
 }
 
-// smbConflictError builds the explosion for operator values that differ from
-// the generated ones. It shows the generated setting next to the operator
-// value and points at the staged file, so the operator can reconcile the file.
-func smbConflictError(target, stagedPath string, conflicts []smbConflict) error {
+// failDrift either explodes or logs a warning, per the policy.
+func (r reconciler) failDrift(format string, args ...interface{}) error {
+	msg := fmt.Sprintf(format, args...)
+	if r.relaxed {
+		log.Printf("WARNING: %s", msg)
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrExplosion, msg)
+}
+
+func reconcileSmb(staged, target string, relaxed bool) error {
+	r := reconciler{target: target, staged: staged, relaxed: relaxed}
+	return r.reconcile(mergeSmb)
+}
+
+func reconcileKrb5(staged, target string, relaxed bool) error {
+	r := reconciler{target: target, staged: staged, relaxed: relaxed}
+	return r.reconcile(mergeKrb5)
+}
+
+// reconcile implements the policy above: read the staged file, then either
+// install or merge the target using the provided merge function.
+func (r reconciler) reconcile(merge func(reconciler) (addedKeys []string, err error)) error {
+	stagedContent, err := os.ReadFile(r.staged)
+	if err != nil {
+		return fmt.Errorf("provisioning: cannot read staged %s: %w", r.staged, err)
+	}
+
+	if _, err := os.Stat(r.target); errors.Is(err, os.ErrNotExist) {
+		if err := writeStagedFile(r.target, stagedContent, 0o644); err != nil {
+			return fmt.Errorf("%w: %s does not exist and cannot be created (%v): "+
+				"provide the file or a writable location for it", ErrExplosion, r.target, err)
+		}
+		log.Printf("Provisioning: installed %s", r.target)
+		return nil
+	}
+
+	current, err := os.ReadFile(r.target)
+	if err != nil {
+		return fmt.Errorf("provisioning: cannot read %s: %w", r.target, err)
+	}
+
+	r.stagedContent = string(stagedContent)
+	r.currentContent = string(current)
+	addedKeys, mergeErr := merge(r)
+	if mergeErr != nil {
+		return mergeErr
+	}
+	if len(addedKeys) > 0 {
+		log.Printf("Provisioning: merged missing settings into %s: %v", r.target, addedKeys)
+	} else {
+		log.Printf("Provisioning: %s carries all generated settings (consult the warnings above when the file is not reconciled)", r.target)
+	}
+	return nil
+}
+
+// mergeSmb adds the generated settings that the operator file does not
+// carry yet, inside [global]. Existing operator values are never replaced.
+// Anything that prevents the generated configuration from being complete — a
+// conflicting operator value, a read-only target, or a [global] section
+// ending in a continuation backslash — follows the strict/relaxed policy:
+// strict fails the daemon naming every offending setting and the generated
+// file, relaxed only warns (the daemon must not run half-configured silently,
+// but a long-running systemd service reports and continues). Returns the
+// lower-cased keys of the inserted lines.
+func mergeSmb(r reconciler) ([]string, error) {
+	plan := smbMergePlan(r.stagedContent, r.currentContent)
+	if len(plan.conflicts) > 0 {
+		if err := r.failDrift("%s", conflictMessage(r, plan.conflicts)); err != nil {
+			return nil, err
+		}
+	}
+	if len(plan.missing) == 0 {
+		return nil, nil
+	}
+	missingLines := settingLines(plan.missing)
+
+	if smbGlobalEndsWithBackslash(r.currentContent) {
+		if err := r.failDrift("%s", missingSettingsMessage(r,
+			"the last [global] line ends with a backslash continuation, which would swallow them", missingLines)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+
+	updated := insertAtGlobalEnd(r.currentContent, missingLines)
+	if err := writeStagedFile(r.target, []byte(updated), 0o644); err != nil {
+		if err := r.failDrift("%s", missingSettingsMessage(r, err.Error(), missingLines)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return settingKeys(missingLines), nil
+}
+
+// mergeKrb5 merges the generated settings into the operator's krb5.conf with
+// exactly the same policy as smb.conf: never replace an operator value, add
+// what is missing, and treat conflicts — or a target that cannot be appended
+// to — as drift. Strict mode explodes; --relaxed warns and keeps running.
+// A read-only file that already carries everything is accepted implicitly
+// (nothing is missing, so nothing is written). The structural markers are
+// braces around subsections (there are no continuation lines), documented in
+// docs/configuration-provisioning.md.
+func mergeKrb5(r reconciler) ([]string, error) {
+	plan, err := krb5MergePlan(r.stagedContent, r.currentContent)
+	if err != nil {
+		if err := r.failDrift("%s", err.Error()); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if len(plan.conflicts) > 0 {
+		if err := r.failDrift("%s", conflictMessage(r, plan.conflicts)); err != nil {
+			return nil, err
+		}
+	}
+	if len(plan.missing) == 0 {
+		return nil, nil
+	}
+	missingLines := settingLines(plan.missing)
+
+	updated, err := insertKrb5Settings(r.currentContent, plan.missing)
+	if err != nil {
+		if err := r.failDrift("%s", missingSettingsMessage(r, err.Error(), missingLines)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	if err := writeStagedFile(r.target, []byte(updated), 0o644); err != nil {
+		if err := r.failDrift("%s", missingSettingsMessage(r, err.Error(), missingLines)); err != nil {
+			return nil, err
+		}
+		return nil, nil
+	}
+	return settingKeys(missingLines), nil
+}
+
+// renderValue indents a multi-line value (krb5 realm block) so drift text
+// stays readable, truncating very long blocks to their first lines.
+func renderValue(value string) string {
+	lines := strings.Split(value, "\n")
+	const maxLines = 8
+	more := 0
+	if len(lines) > maxLines {
+		more = len(lines) - maxLines
+		lines = lines[:maxLines]
+	}
+	out := strings.Join(lines, "\n    ")
+	if more > 0 {
+		out += fmt.Sprintf("\n    ... (%d more line(s))", more)
+	}
+	return out
+}
+
+// conflictMessage describes operator values that differ from the generated
+// ones. It is shared by both formats: the normalized comparison produced the
+// same conflicts shape for smb.conf and krb5.conf. Multi-line values (krb5
+// realm blocks) are rendered as indented blocks.
+func conflictMessage(r reconciler, conflicts []fileConflict) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s has operator settings that differ from the generated configuration:", target)
+	fmt.Fprintf(&b, "%s has operator settings that differ from the generated configuration:", r.target)
 	for _, c := range conflicts {
-		fmt.Fprintf(&b, "\n  %s = %q\n  generated: %s", c.Key, c.Current, c.Line)
+		if strings.Contains(c.Current, "\n") || strings.Contains(c.Want, "\n") {
+			fmt.Fprintf(&b, "\n  %s:\n  operator:\n    %s\n  generated:\n    %s",
+				c.Key, renderValue(c.Current), renderValue(c.Want))
+			continue
+		}
+		fmt.Fprintf(&b, "\n  %s: operator value %q\n  generated: %s", c.Key, c.Current, strings.Join(c.Lines, " / "))
 	}
 	fmt.Fprintf(&b, "\nExisting operator values are never overwritten.\n"+
 		"To fix, update %s so it matches the generated configuration (%s), "+
-		"or fix the rdpgw-auth configuration that produced it. Then restart.", target, stagedPath)
-	return fmt.Errorf("%w: %s", ErrExplosion, b.String())
+		"or fix the rdpgw-auth configuration that produced it. Then restart. "+
+		"Alternatively start with --relaxed to log the drift and keep running.", r.target, r.staged)
+	return b.String()
 }
 
-// missingSettingsError builds the explosion for required settings that could
-// not be added, listing every generated line the operator file is missing and
-// where the full generated file lives.
-func missingSettingsError(target, stagedPath, reason string, missing []string) error {
+// missingSettingsMessage describes the required settings that could not be
+// added, listing every generated line the operator file is missing and where
+// the full generated file lives.
+func missingSettingsMessage(r reconciler, reason string, missing []string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "cannot add the required settings to %s (%s):", target, reason)
+	fmt.Fprintf(&b, "cannot add the required settings to %s (%s):", r.target, reason)
 	for _, line := range missing {
 		fmt.Fprintf(&b, "\n  %s", line)
 	}
 	fmt.Fprintf(&b, "\nGenerated configuration: %s\n"+
 		"To fix, remove the obstacle above so these settings can be added, "+
-		"or fix the rdpgw-auth configuration that produced them. Then restart.", stagedPath)
-	return fmt.Errorf("%w: %s", ErrExplosion, b.String())
-}
-
-// mergeSmbConf adds the generated settings that the operator file does not
-// carry yet, inside [global]. Existing operator values are never replaced.
-// Anything that prevents the generated configuration from being complete — a
-// conflicting operator value, a read-only target, or a [global] section
-// ending in a continuation backslash — is an ErrExplosion naming every
-// offending setting and the generated file: the daemon must not run
-// half-configured.
-func mergeSmbConf(target, stagedPath, staged, current string) (addedKeys []string, err error) {
-	missing, conflicts := smbMergePlan(staged, current)
-	if len(conflicts) > 0 {
-		return nil, smbConflictError(target, stagedPath, conflicts)
-	}
-	if len(missing) == 0 {
-		return nil, nil
-	}
-
-	if smbGlobalEndsWithBackslash(current) {
-		return nil, missingSettingsError(target, stagedPath,
-			"the last [global] line ends with a backslash continuation, which would swallow them", missing)
-	}
-
-	updated := insertAtGlobalEnd(current, missing)
-	if err := writeStagedFile(target, []byte(updated), 0o644); err != nil {
-		return nil, missingSettingsError(target, stagedPath, err.Error(), missing)
-	}
-	return settingKeys(missing), nil
+		"or fix the rdpgw-auth configuration that produced them. Then restart.",
+		r.staged)
+	return b.String()
 }
 
 // settingKeys returns the lower-cased keys of the given "key = value" lines.
@@ -549,6 +702,9 @@ func insertAtGlobalEnd(content string, lines []string) string {
 			break
 		}
 	}
+	// A file that does not end with a newline would otherwise swallow the
+	// first inserted setting onto the last operator line.
+	ensureLineBreakBefore(kept, insertAt)
 
 	var b strings.Builder
 	for i := 0; i < insertAt; i++ {

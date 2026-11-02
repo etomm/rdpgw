@@ -141,3 +141,22 @@ Users:
 ```
 
 Are automatically mapped into the new pipeline structure if the `AuthProtocols` block is omitted.
+
+## Provisioning drift and `--relaxed`
+
+`rdpgw-auth` provisions `smb.conf` and `krb5.conf` from its own configuration
+and never overwrites operator values: missing settings are appended, a
+differing value is drift. Strict mode (the default) refuses to start;
+`--relaxed` logs the drift and keeps running. The full merge model -
+normalization, comparison and insertion for both files - is documented in
+[Configuration provisioning](configuration-provisioning.md).
+
+Long-lived systemd deployments usually pass `--relaxed` so a value difference
+in an operator-owned file becomes a loud warning instead of an outage:
+
+```ini
+# /etc/systemd/system/rdpgw-auth.service (excerpt)
+[Service]
+Environment=RDPGW_AUTH_EXTERNAL_WINBIND=1
+ExecStart=/usr/local/bin/rdpgw-auth --conf /etc/rdpgw-auth.yaml --relaxed
+```

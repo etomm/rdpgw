@@ -9,6 +9,24 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `krb5.conf` is no longer regenerated wholesale every start: like
+  `smb.conf` it is reconciled against the generated settings and existing
+  operator values are never overwritten, now uniformly for both files. A
+  `[realms]` block is treated as one setting whose value is the collected
+  `{ ... }` text (interior lines and EOLs kept verbatim), so a missing realm
+  block is appended exactly as generated while a differing one is reported
+  as drift instead of being merged into. Realm names must be upper case
+  (AD convention); a block name that differs only in case is drift, never a
+  duplicate block. Single relations (`[libdefaults]`,
+  `[domain_realm]`) are appended inside their section when missing. See
+  [docs/configuration-provisioning.md](docs/configuration-provisioning.md).
+- Provisioning drift in operator-managed files is reported per the new
+  `--relaxed` policy instead of only strict: an operator value that differs
+  from the generated settings, or settings that cannot be appended to a
+  read-only target, stop the daemon in strict mode (containers catch drift
+  at deploy time) and only produce a warning with `--relaxed` (systemd
+  deployments keep running). The policy is identical for `smb.conf` and
+  `krb5.conf`; a read-only file that already carries everything is accepted.
 - The dev container image no longer ships a baked-in TLS key/cert.
   The runtime image carries `openssl` and the entrypoint generates an
   ephemeral self-signed cert at first start if none is mounted at the
@@ -49,6 +67,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `Ntlm.Winbind.RequireMembershipOf`, `Ntlm.Winbind.Timeout`,
   `Ntlm.Winbind.StripDomain`, `Ntlm.Winbind.Separator`. See
   [docs/ntlm-authentication.md](docs/ntlm-authentication.md).
+- `rdpgw-auth --relaxed`: warn about operator-managed system files
+  (`smb.conf`/`krb5.conf`) differing from the generated configuration
+  instead of refusing to start. Strict is the default; see
+  [docs/advanced-auth-configuration.md](docs/advanced-auth-configuration.md).
+- Brace-aware krb5.conf merge: a `[realms]` block is one setting whose value
+  is the collected `{ ... }` text, so a missing block is appended verbatim
+  and a differing one is drift; missing single relations are inserted inside
+  their section. Documented together with the smb.conf merge in
+  [docs/configuration-provisioning.md](docs/configuration-provisioning.md).
 - `rdpgw-auth --allow-uid` and `--allow-gid` flags (repeatable).
 - `Server.TrustedProxies` (`[]string`, CIDR, default empty).
 - `Server.AllowedDestinationPorts` (`[]int`, default `[3389]`).

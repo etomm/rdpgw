@@ -52,6 +52,7 @@ func modernWinbindConf(t *testing.T) config.Configuration {
 func legacyConf(t *testing.T) config.Configuration {
 	return config.Configuration{
 		Winbind: &config.WinbindConfig{
+			Domain:       "corp.example.com",
 			Workgroup:    "CORP",
 			Hostname:     "rdpgw-auth",
 			NtlmAuthPath: mustFakeHelper(t),
@@ -102,7 +103,11 @@ func stageFor(t *testing.T, conf config.Configuration) (stagedSmb, stagedKrb5 st
 	if err != nil {
 		t.Fatal(err)
 	}
-	krb5, err := stageTemplate("krb5.conf.tmpl", buildKrb5Data(conf), p.StageDir)
+	krb5Data, err := buildKrb5Data(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	krb5, err := stageTemplate("krb5.conf.tmpl", krb5Data, p.StageDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,6 +118,67 @@ func TestProvisionSkippedWithoutWinbind(t *testing.T) {
 	conf := config.Configuration{}
 	if Provision(conf, Options{}) != nil {
 		t.Fatal("provisioning must be a no-op without any winbind capability")
+	}
+}
+
+func TestUsesWinbindCapability(t *testing.T) {
+	base := func() config.Configuration {
+		return config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{}}
+	}
+	cases := []struct {
+		name string
+		conf config.Configuration
+		want bool
+	}{
+		{"no protocols", base(), false},
+		{
+			"kerberos keytab share",
+			config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{
+				Kerberos: &config.KerberosProtocolConfig{Share: true},
+			}},
+			true,
+		},
+		{
+			"ntlm users backend",
+			config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{
+				Ntlm: &config.NtlmProtocolConfig{Enabled: true, Backends: []string{config.NtlmBackendUsers}},
+			}},
+			false,
+		},
+		{
+			"ntlm winbind backend",
+			config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{
+				Ntlm: &config.NtlmProtocolConfig{Enabled: true, Backends: []string{config.NtlmBackendWinbind}},
+			}},
+			true,
+		},
+		{
+			"basic winbind backend",
+			config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{
+				Basic: &config.BasicProtocolConfig{
+					Enabled: true,
+					Stack:   []config.BasicStackEntry{{Backend: config.BasicBackendWinbind}},
+				},
+			}},
+			true,
+		},
+		{
+			"basic unix backend",
+			config.Configuration{AuthProtocols: &config.AuthProtocolsConfig{
+				Basic: &config.BasicProtocolConfig{
+					Enabled: true,
+					Stack:   []config.BasicStackEntry{{Backend: config.BasicBackendUnix}},
+				},
+			}},
+			false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := UsesWinbind(tc.conf); got != tc.want {
+				t.Errorf("UsesWinbind = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -175,11 +241,11 @@ func TestProvisionInstallsTargetsWhenAbsent(t *testing.T) {
 		{
 			name:             "legacy",
 			conf:             legacyConf(t),
-			krb5DefaultRealm: "CORP",
-			krb5DomainLine:   ".CORP = CORP",
+			krb5DefaultRealm: "CORP.EXAMPLE.COM",
+			krb5DomainLine:   ".corp.example.com = CORP.EXAMPLE.COM",
 			wantSeparator:    `\`,
 			wants: []string{
-				"realm = CORP", // NetBIOS fallback documented in the migration plan
+				"realm = CORP.EXAMPLE.COM",
 				"workgroup = CORP",
 				"netbios name = rdpgw-auth",
 				"# winbind separator omitted on purpose", // backslash = default, never written
@@ -190,7 +256,7 @@ func TestProvisionInstallsTargetsWhenAbsent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := optsFor(t)
-			if err := provision(tc.conf, p); err != nil {
+			if err := provision(tc.conf, p, false); err != nil {
 				t.Fatal(err)
 			}
 			staged, stkrb5 := stageFor(t, tc.conf)
@@ -258,7 +324,7 @@ func TestProvisionMergesIntoWritableOperatorFile(t *testing.T) {
 	if err := os.WriteFile(p.SmbTarget, preexisting, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, false); err != nil {
 		t.Fatal(err)
 	}
 	got := string(mustRead(t, p.SmbTarget))
@@ -284,7 +350,7 @@ func TestProvisionDoesNotPublishKrb5WithoutShare(t *testing.T) {
 	conf.AuthProtocols.Kerberos.Share = false
 	shared := conf.AuthProtocols.Kerberos.Krb5ConfPath
 	p := optsFor(t)
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(shared); !errors.Is(err, os.ErrNotExist) {
@@ -315,7 +381,7 @@ func TestProvisionMispointedKeytabExplodes(t *testing.T) {
 	}
 	before := mustRead(t, p.SmbTarget)
 
-	err := provision(conf, p)
+	err := provision(conf, p, false)
 	if !errors.Is(err, ErrExplosion) {
 		t.Fatalf("conflicting operator values must explode, got %v", err)
 	}
@@ -358,7 +424,7 @@ func TestProvisionContinuationKeytabDirectiveExplodes(t *testing.T) {
 	}
 	before := mustRead(t, p.SmbTarget)
 
-	err := provision(conf, p)
+	err := provision(conf, p, false)
 	if !errors.Is(err, ErrExplosion) {
 		t.Fatalf("conflicting continuation directive must explode, got %v", err)
 	}
@@ -396,7 +462,7 @@ func TestProvisionMergeInsertsInsideGlobalSection(t *testing.T) {
 	if err := os.WriteFile(p.SmbTarget, preexisting, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, false); err != nil {
 		t.Fatal(err)
 	}
 	got := string(mustRead(t, p.SmbTarget))
@@ -421,7 +487,7 @@ func TestProvisionWritableAlreadyCompleteUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := mustRead(t, p.SmbTarget)
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, false); err != nil {
 		t.Fatal(err)
 	}
 	if after := mustRead(t, p.SmbTarget); string(after) != string(before) {
@@ -449,7 +515,7 @@ func TestProvisionReadOnlyEquivalentAccepted(t *testing.T) {
 	restoreKrb5 := readOnlyFor(t, p.Krb5Target, syscall.EROFS)
 	defer restoreKrb5()
 
-	if err := provision(conf, p); err != nil {
+	if err := provision(conf, p, false); err != nil {
 		t.Fatalf("semantically equal read-only targets must be accepted: %v", err)
 	}
 	if got, _ := os.ReadFile(p.SmbTarget); string(got) != string(mustRead(t, staged)) {
@@ -470,7 +536,7 @@ func TestProvisionReadOnlyMissingSettingsExplodes(t *testing.T) {
 	restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
 	defer restore()
 
-	err := provision(conf, p)
+	err := provision(conf, p, false)
 	if !errors.Is(err, ErrExplosion) {
 		t.Fatalf("read-only smb.conf missing required settings must explode, got %v", err)
 	}
@@ -506,7 +572,7 @@ func TestProvisionWritableContinuationHazardExplodes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err := provision(conf, p)
+	err := provision(conf, p, false)
 	if !errors.Is(err, ErrExplosion) {
 		t.Fatalf("continuation hazard must explode, got %v", err)
 	}
@@ -516,7 +582,7 @@ func TestProvisionWritableContinuationHazardExplodes(t *testing.T) {
 	if !strings.Contains(err.Error(), "Generated configuration:") || !strings.Contains(err.Error(), p.StageDir) {
 		t.Errorf("explosion must point at the generated file: %v", err)
 	}
-	if !strings.Contains(err.Error(), "realm = CORP") {
+	if !strings.Contains(err.Error(), "realm = CORP.EXAMPLE.COM") {
 		t.Errorf("explosion must list the settings it could not add: %v", err)
 	}
 	if body, _ := os.ReadFile(p.SmbTarget); string(body) != string(operator) {
@@ -551,7 +617,7 @@ func TestProvisionContinuationSeparatorDriftExplodes(t *testing.T) {
 	}
 	restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
 	defer restore()
-	err := provision(conf, p)
+	err := provision(conf, p, false)
 	if !errors.Is(err, ErrExplosion) {
 		t.Fatalf("drifted read-only smb.conf must explode, got %v", err)
 	}
@@ -651,47 +717,72 @@ func TestBuildSmbDataSeparatorFormatting(t *testing.T) {
 	}
 }
 
-func TestProvisionKrb5DriftWarns(t *testing.T) {
-	// Exactly the rdpgw-auth deployment: krb5.conf is a read-only ConfigMap
-	// subPath mount. Provisioning must warn about the drift and continue —
-	// never crashloop the daemon.
+func TestProvisionReadOnlyKrb5BehavesLikeSmb(t *testing.T) {
+	// krb5.conf follows the exact same policy as smb.conf: strict mode
+	// refuses to start when the operator file drifts or the missing
+	// settings cannot be appended (any write error, EROFS or EACCES), and
+	// --relaxed warns while keeping the file untouched. Only a file that
+	// already carries everything is accepted without writing.
 	conf := modernWinbindConf(t)
-	p := optsFor(t)
 	operator := []byte("[libdefaults]\n    default_realm = EX.FI\n")
-	if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	restore := readOnlyFor(t, p.Krb5Target, syscall.EROFS)
-	defer restore()
 
-	if err := provision(conf, p); err != nil {
-		t.Fatalf("read-only krb5.conf must not fail provisioning: %v", err)
-	}
-	body, _ := os.ReadFile(p.Krb5Target)
-	if string(body) != string(operator) {
-		t.Errorf("read-only krb5.conf content must stay untouched:\n%s", body)
-	}
-}
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"read-only filesystem", syscall.EROFS},
+		{"permission denied", syscall.EACCES},
+	} {
+		t.Run(tc.name+"/strict explodes", func(t *testing.T) {
+			p := optsFor(t)
+			if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			restore := readOnlyFor(t, p.Krb5Target, tc.err)
+			defer restore()
 
-func TestProvisionKrb5NonErofsWriteErrorWarns(t *testing.T) {
-	// Mounts can also deny writes with EACCES; any unwritable target is
-	// operator-managed and only produces a warning.
-	conf := modernWinbindConf(t)
-	p := optsFor(t)
-	operator := []byte("[libdefaults]\n    default_realm = EX.FI\n")
-	if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	restore := readOnlyFor(t, p.Krb5Target, syscall.EACCES)
-	defer restore()
+			err := provision(conf, p, false)
+			if !errors.Is(err, ErrExplosion) {
+				t.Fatalf("unwritable drifted krb5.conf must explode in strict mode, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "default_realm") {
+				t.Errorf("explosion must name the conflicting setting: %v", err)
+			}
+			if body := mustRead(t, p.Krb5Target); string(body) != string(operator) {
+				t.Errorf("krb5.conf content must stay untouched:\n%s", body)
+			}
+		})
 
-	if err := provision(conf, p); err != nil {
-		t.Fatalf("unwritable krb5.conf must not fail provisioning: %v", err)
+		t.Run(tc.name+"/relaxed warns", func(t *testing.T) {
+			p := optsFor(t)
+			if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			restore := readOnlyFor(t, p.Krb5Target, tc.err)
+			defer restore()
+
+			if err := provision(conf, p, true); err != nil {
+				t.Fatalf("relaxed must keep running on an unwritable krb5.conf: %v", err)
+			}
+			if body := mustRead(t, p.Krb5Target); string(body) != string(operator) {
+				t.Errorf("unwritable krb5.conf content must stay untouched:\n%s", body)
+			}
+		})
 	}
-	body, _ := os.ReadFile(p.Krb5Target)
-	if string(body) != string(operator) {
-		t.Errorf("unwritable krb5.conf content must stay untouched:\n%s", body)
-	}
+
+	t.Run("read-only equivalent is accepted", func(t *testing.T) {
+		p := optsFor(t)
+		_, stagedKrb5 := stageFor(t, conf)
+		body := mustRead(t, stagedKrb5)
+		if err := os.WriteFile(p.Krb5Target, body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		restore := readOnlyFor(t, p.Krb5Target, syscall.EROFS)
+		defer restore()
+		if err := provision(conf, p, false); err != nil {
+			t.Fatalf("semantically equal read-only krb5.conf must be accepted: %v", err)
+		}
+	})
 }
 
 func TestProvisionMissingTargetUnwritableExplodes(t *testing.T) {
@@ -702,7 +793,362 @@ func TestProvisionMissingTargetUnwritableExplodes(t *testing.T) {
 	restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
 	defer restore()
 
-	if err := provision(conf, p); !errors.Is(err, ErrExplosion) {
+	if err := provision(conf, p, false); !errors.Is(err, ErrExplosion) {
 		t.Fatalf("missing unwritable smb.conf must explode, got %v", err)
 	}
+}
+
+func TestRelaxedWarnsInsteadOfExplodes(t *testing.T) {
+	// The --relaxed policy: strict explodes on operator drift and on
+	// settings that cannot be added, relaxed logs the drift and keeps
+	// running. Operator values are never replaced in either mode.
+	conf := modernWinbindConf(t)
+
+	t.Run("smb conflict", func(t *testing.T) {
+		p := optsFor(t)
+		operator := []byte("[global]\n    security = ads\n    kerberos method = secrets only\n")
+		if err := os.WriteFile(p.SmbTarget, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, true); err != nil {
+			t.Fatalf("relaxed must keep running on smb.conf drift: %v", err)
+		}
+		if body, _ := os.ReadFile(p.SmbTarget); !strings.Contains(string(body), "kerberos method = secrets only") {
+			t.Errorf("the operator value must stay untouched:\n%s", body)
+		}
+	})
+
+	t.Run("smb read-only missing settings", func(t *testing.T) {
+		p := optsFor(t)
+		operator := []byte("[global]\n    security = ads\n")
+		if err := os.WriteFile(p.SmbTarget, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		restore := readOnlyFor(t, p.SmbTarget, syscall.EROFS)
+		defer restore()
+		if err := provision(conf, p, true); err != nil {
+			t.Fatalf("relaxed must keep running when settings cannot be added: %v", err)
+		}
+	})
+
+	t.Run("strict still explodes", func(t *testing.T) {
+		p := optsFor(t)
+		operator := []byte("[global]\n    security = ads\n    kerberos method = secrets only\n")
+		if err := os.WriteFile(p.SmbTarget, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, false); !errors.Is(err, ErrExplosion) {
+			t.Fatalf("strict must still explode on drift, got %v", err)
+		}
+	})
+}
+
+func TestKrb5MergeIntoOperatorFile(t *testing.T) {
+	// A writable krb5.conf is never overwritten: missing settings are
+	// merged into their section (and into the realm block), operator
+	// settings are preserved, nothing is duplicated.
+	conf := modernWinbindConf(t)
+	p := optsFor(t)
+	operator := []byte(`[libdefaults]
+    default_realm = CORP.EXAMPLE.COM
+    # operator comment kept
+    clockskew = 300
+
+[realms]
+    OTHER.REALM = {
+        kdc = other.example.com:88
+        auth_to_local_names = {
+            extra = rule
+        }
+    }
+
+[domain_realm]
+    .other.dom = OTHER.REALM
+`)
+	if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := provision(conf, p, false); err != nil {
+		t.Fatal(err)
+	}
+	got := string(mustRead(t, p.Krb5Target))
+	for _, want := range []string{
+		"operator comment kept",                // operator content untouched
+		"clockskew = 300",                      // unmanaged relation untouched
+		".other.dom = OTHER.REALM",             // operator mapping kept
+		"other.example.com:88",                 // other realm kept
+		"            extra = rule",             // nested subsection structure kept
+		"dns_lookup_realm = true",              // missing libdefaults relation added
+		"dns_lookup_kdc = true",                // missing libdefaults relation added
+		".corp.example.com = CORP.EXAMPLE.COM", // generated mapping added
+		"corp.example.com = CORP.EXAMPLE.COM",  // generated mapping added
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("merged krb5.conf missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "default_realm =") != 1 {
+		t.Errorf("existing operator settings must not be duplicated:\n%s", got)
+	}
+}
+
+func TestKrb5RealmBlockIsOneSetting(t *testing.T) {
+	// An existing realm block is one setting whose value is the collected
+	// `{ ... }` text: different text is drift (never merged into), so strict
+	// explodes and relaxed warns. The operator block stays untouched.
+	conf := modernWinbindConf(t)
+	conf.Winbind.DomainControllers = []config.FlexibleDomainController{
+		{DomainController: config.DomainController{Host: "dc1.corp.example.com", Port: 88, AdminPort: 749}},
+	}
+	operator := []byte(`[libdefaults]
+    default_realm = CORP.EXAMPLE.COM
+
+[realms]
+    CORP.EXAMPLE.COM = {
+        auth_to_local_names = {
+            extra = rule
+        }
+    }
+
+[domain_realm]
+`)
+
+	t.Run("strict", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		err := provision(conf, p, false)
+		if !errors.Is(err, ErrExplosion) {
+			t.Fatalf("a differing realm block must explode in strict mode, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "realms/CORP.EXAMPLE.COM") {
+			t.Errorf("explosion must name the realm block setting: %v", err)
+		}
+		if body := mustRead(t, p.Krb5Target); string(body) != string(operator) {
+			t.Errorf("operator realm block must stay untouched:\n%s", body)
+		}
+	})
+
+	t.Run("relaxed", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, true); err != nil {
+			t.Fatalf("relaxed must keep running on realm-block drift: %v", err)
+		}
+		got := string(mustRead(t, p.Krb5Target))
+		if !strings.Contains(got, "auth_to_local_names = {") {
+			t.Errorf("operator block must stay untouched:\n%s", got)
+		}
+		if strings.Contains(got, "kdc = dc1.corp.example.com:88") {
+			t.Errorf("a differing block must never be merged into:\n%s", got)
+		}
+	})
+}
+
+func TestKrb5RealmNameMustBeUpperCase(t *testing.T) {
+	// Realm names identify the block and follow the AD upper-case
+	// convention. A block whose name only differs in case is drift — never
+	// appended as a (case) duplicate: strict explodes, --relaxed warns.
+	conf := modernWinbindConf(t)
+	conf.Winbind.DomainControllers = []config.FlexibleDomainController{
+		{DomainController: config.DomainController{Host: "dc1.corp.example.com", Port: 88, AdminPort: 749}},
+	}
+	_, stagedKrb5 := stageFor(t, conf)
+	stagedBody := string(mustRead(t, stagedKrb5))
+	lowered := strings.Replace(stagedBody, "CORP.EXAMPLE.COM = {", "corp.example.com = {", 1)
+	if lowered == stagedBody {
+		t.Fatal("fixture: generated realm header not found")
+	}
+
+	for _, relaxed := range []bool{false, true} {
+		name := "strict"
+		if relaxed {
+			name = "relaxed"
+		}
+		t.Run(name, func(t *testing.T) {
+			p := optsFor(t)
+			if err := os.WriteFile(p.Krb5Target, []byte(lowered), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			err := provision(conf, p, relaxed)
+			if relaxed {
+				if err != nil {
+					t.Fatalf("relaxed must keep running on realm-name drift: %v", err)
+				}
+			} else {
+				if !errors.Is(err, ErrExplosion) {
+					t.Fatalf("lower-case realm name must explode in strict mode, got %v", err)
+				}
+				if !strings.Contains(err.Error(), "upper case") {
+					t.Errorf("explosion must explain the upper-case requirement: %v", err)
+				}
+			}
+			got := string(mustRead(t, p.Krb5Target))
+			if got != lowered {
+				t.Errorf("the operator realm block must stay untouched:\n%s", got)
+			}
+			if strings.Count(got, "= {") != 1 {
+				t.Errorf("a case-wise duplicate realm block must never be appended:\n%s", got)
+			}
+		})
+	}
+}
+
+func TestKrb5MissingRealmBlockAppendedVerbatim(t *testing.T) {
+	// A missing realm block is appended from the staged text byte for byte:
+	// header line, inner indentation, kdc/admin_server lines and the closing
+	// brace all come from the generated file unchanged.
+	conf := modernWinbindConf(t)
+	conf.Winbind.DomainControllers = []config.FlexibleDomainController{
+		{DomainController: config.DomainController{Host: "dc1.corp.example.com", Port: 88, AdminPort: 749}},
+		{DomainController: config.DomainController{Host: "dc2.corp.example.com", Port: 88, AdminPort: 749}},
+	}
+	p := optsFor(t)
+	operator := []byte(`[libdefaults]
+    default_realm = CORP.EXAMPLE.COM
+
+[realms]
+    OTHER.REALM = {
+        kdc = other.example.com:88
+    }
+
+[domain_realm]
+    .other.dom = OTHER.REALM
+`)
+	if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := provision(conf, p, false); err != nil {
+		t.Fatal(err)
+	}
+	got := string(mustRead(t, p.Krb5Target))
+
+	// Our realm block's collected text must be present exactly as staged,
+	// with the original interior indentation (8 spaces) preserved.
+	wantedBlock := "    CORP.EXAMPLE.COM = {\n" +
+		"        kdc = dc1.corp.example.com:88\n" +
+		"        admin_server = dc1.corp.example.com:749\n" +
+		"        kdc = dc2.corp.example.com:88\n" +
+		"        admin_server = dc2.corp.example.com:749\n" +
+		"    }"
+	if !strings.Contains(got, wantedBlock) {
+		t.Errorf("missing realm block appended verbatim:\n%s", got)
+	}
+	if !strings.Contains(got, "kdc = other.example.com:88") {
+		t.Errorf("operator realm must stay untouched:\n%s", got)
+	}
+	if strings.Count(got, "CORP.EXAMPLE.COM = {") != 1 {
+		t.Errorf("the generated realm block must be appended exactly once:\n%s", got)
+	}
+	if unbalancedTestBraces(got) {
+		t.Errorf("merge must leave the brace structure balanced:\n%s", got)
+	}
+}
+
+func unbalancedTestBraces(content string) bool {
+	depth := 0
+	for _, raw := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(raw)
+		if strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") || line == "" {
+			continue
+		}
+		if line == "}" {
+			depth--
+			continue
+		}
+		if strings.HasSuffix(line, "{") {
+			depth++
+		}
+	}
+	return depth != 0
+}
+
+func TestKrb5ConflictExplodesStrictWarnsRelaxed(t *testing.T) {
+	// A conflicting krb5.conf value follows the strict/relaxed policy: never
+	// replaced, fatal in strict mode (deploy-time catch), warning in
+	// relaxed mode.
+	conf := modernWinbindConf(t)
+	operator := []byte("[libdefaults]\n    default_realm = EX.FI\n")
+
+	t.Run("strict", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		before := mustRead(t, p.Krb5Target)
+		err := provision(conf, p, false)
+		if !errors.Is(err, ErrExplosion) {
+			t.Fatalf("conflicting krb5.conf value must explode in strict mode, got %v", err)
+		}
+		if !strings.Contains(err.Error(), "default_realm") {
+			t.Errorf("explosion must name the conflicting setting: %v", err)
+		}
+		if after := mustRead(t, p.Krb5Target); string(after) != string(before) {
+			t.Errorf("conflicting krb5.conf must stay untouched:\n%s", after)
+		}
+	})
+
+	t.Run("relaxed", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.Krb5Target, operator, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, true); err != nil {
+			t.Fatalf("relaxed must keep running on krb5.conf drift: %v", err)
+		}
+		got := mustRead(t, p.Krb5Target)
+		// The conflicting operator value is never replaced…...
+		if !strings.Contains(string(got), "default_realm = EX.FI") {
+			t.Errorf("operator values are never replaced:\n%s", got)
+		}
+		// ……but the missing settings are still merged in relaxed mode.
+		for _, want := range []string{"dns_lookup_realm = true", "dns_lookup_kdc = true", ".corp.example.com = CORP.EXAMPLE.COM"} {
+			if !strings.Contains(string(got), want) {
+				t.Errorf("relaxed must still add the missing generation %q:\n%s", want, got)
+			}
+		}
+	})
+}
+
+func TestMergeStartsOnANewLineWithoutTrailingNewline(t *testing.T) {
+	// An operator file that does not end with a newline must not swallow the
+	// first merged setting onto its last line.
+	conf := modernWinbindConf(t)
+
+	t.Run("smb.conf", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.SmbTarget, []byte("[global]\n    security = ads"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, false); err != nil {
+			t.Fatal(err)
+		}
+		got := string(mustRead(t, p.SmbTarget))
+		if !strings.Contains(got, "security = ads\n    ") {
+			t.Errorf("first merged setting was concatenated onto the last line:\n%s", got)
+		}
+		if strings.Contains(got, "security = ads    ") || strings.Contains(got, "adsdedicated") {
+			t.Errorf("first merged setting was concatenated onto the last line:\n%s", got)
+		}
+	})
+
+	t.Run("krb5.conf", func(t *testing.T) {
+		p := optsFor(t)
+		if err := os.WriteFile(p.Krb5Target, []byte("[libdefaults]\n    default_realm = CORP.EXAMPLE.COM"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := provision(conf, p, false); err != nil {
+			t.Fatal(err)
+		}
+		got := string(mustRead(t, p.Krb5Target))
+		if !strings.Contains(got, "default_realm = CORP.EXAMPLE.COM\n    ") {
+			t.Errorf("first merged relation was concatenated onto the last line:\n%s", got)
+		}
+		if strings.Contains(got, "CORP.EXAMPLE.COMdns_lookup") {
+			t.Errorf("merged relation was concatenated onto the last line:\n%s", got)
+		}
+	})
 }

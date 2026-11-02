@@ -30,6 +30,12 @@ var opts struct {
 	// root (winbindd needs samba's root-owned state) and passes
 	// `--serve-user rdpgw`, reproducing the old `su-exec rdpgw` step.
 	ServeUser string `long:"serve-user" description:"run the gRPC server as this user after starting winbindd (requires root)"`
+	// Relaxed downgrades provisioning drift in operator-managed system files
+	// (smb.conf, krb5.conf) from fatal to warnings: the daemon logs what
+	// differs and keeps running. Operator values are never replaced in
+	// either mode. Strict (default) refuses to start instead so container
+	// deployments catch misconfiguration at deploy time.
+	Relaxed bool `long:"relaxed" description:"warn about operator-managed system files (smb.conf, krb5.conf) differing from the generated configuration instead of refusing to start"`
 	// Serve is the internal child mode: provisioning, domain join and
 	// winbindd supervision are already done by the parent process.
 	Serve bool `long:"serve" hidden:"true" description:"internal: serve gRPC only (used by the supervisor parent)"`
@@ -59,7 +65,10 @@ func main() {
 	// Stage and reconcile samba/kerberos files and, when rdpgw-auth runs
 	// winbindd itself, prepare its runtime state before any join or
 	// supervision happens. Without winbind capability this is a no-op.
-	if err := provisioning.Provision(conf, provisioning.Options{ManagedWinbind: !supervisor.External()}); err != nil {
+	if err := provisioning.Provision(conf, provisioning.Options{
+		ManagedWinbind: !supervisor.External(),
+		Relaxed:        opts.Relaxed,
+	}); err != nil {
 		log.Fatalf("Provisioning failed: %v", err)
 	}
 

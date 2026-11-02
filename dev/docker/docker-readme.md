@@ -46,13 +46,20 @@ docker build -f dev/docker/Dockerfile.auth-winbind -t rdpgw-auth .
 ```
 
 The image is published both as `rdpgw-auth` and (legacy alias)
-`rdpgw-auth-winbind`; both tags point at the same build.
+`rdpgw-auth-winbind`; both tags point at the same build. Pass `--relaxed`
+to log provisioning drift instead of refusing to start (host/systemd
+deployments).
 
 `winbind` only works on a host that is joined to the domain. Choose one of two
 ways to provide that:
 
-1. **Run winbindd in the container.** Mount a domain member `smb.conf` and a
-   persistent `/var/lib/samba` volume. `rdpgw-auth` joins the domain automatically if you pass `AD_JOIN_USER` and `AD_JOIN_PASSWORD`, or waits cleanly for a manual join (`net ads join -U Administrator`). Once joined, the state is persisted in `/var/lib/samba` across restarts. It then refreshes the shared keytab, verifies/registers the configured SPNs, starts and supervises `winbindd` (readiness check via `wbinfo -p`, graceful stop on SIGTERM) and runs the gRPC server as UID 1001.
+1. **Run winbindd in the container.** Mount a persistent `/var/lib/samba`
+   volume so the domain membership survives restarts. Mounting a domain member
+   `smb.conf` and `krb5.conf` is optional now: `rdpgw-auth` provisions them
+   from the configuration (operator files keep winning: missing settings are
+   appended, values are never overwritten; a value that differs refuses to
+   start, unless the daemon runs with `--relaxed`, which logs the drift and
+   keeps running - the mode designed for long-lived systemd services).
 
    ```bash
    # Automatic join on first start:
