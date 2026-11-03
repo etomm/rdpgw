@@ -23,7 +23,7 @@ module semantics, import paths resolve locally against the declaration in
    - Pros: zero churn; identical to how every other fork of this project
      is structured; diff-rebase friendliness against upstream stays
      maximal ([no import-path conflicts in merges]).
-   - Cons: misleading provenance — readers of the source tree believe the
+   - Cons: misleading provenance - readers of the source tree believe the
      code comes from `bolkedebruin`; if the fork is ever consumed as a
      library (`go get <fork>/...`) it cannot be, because Go refuses to
      resolve a forked module whose declared path points elsewhere.
@@ -31,7 +31,7 @@ module semantics, import paths resolve locally against the declaration in
    - Pros: honest provenance for the tree shape that actually exists.
    - Cons: still not "your" namespace; same rebase friction as option 3.
 3. **Rename to the final fork destination** (e.g. `github.com/<owner>/rdpgw`).
-   - Status: **open — currently not desired** by the maintainer for this
+   - Status: **open - currently not desired** by the maintainer for this
      proposal; recorded here because it is the long-term end state most
      Go forks converge to once the fork stops tracking upstream.
 
@@ -83,7 +83,7 @@ mirror must be manually kept in sync with `auth.go` after each change.
 ### Options
 1. Keep it: catches field-rename drift early on every platform.
 2. Replace with a build-tag-protected thin `newNtlmBackend` extracted into
-   a Linux/cgo-free helper package that `auth.go` imports directly — no
+   a Linux/cgo-free helper package that `auth.go` imports directly - no
    mirror at all, single source of truth (needs a small package split).
 
 ### Open questions

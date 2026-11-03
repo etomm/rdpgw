@@ -60,6 +60,18 @@ The configuration is done through a YAML file. The configuration file is read fr
 At the bottom of this README is an example configuration file. In these sections you will find the most important
 settings.
 
+## Authentication guides
+
+| Topic | Document |
+|-------|----------|
+| Modern + legacy auth configuration reference | [docs/advanced-auth-configuration.md](docs/advanced-auth-configuration.md) |
+| Provisioning and merge policy | [docs/configuration-provisioning.md](docs/configuration-provisioning.md) |
+| NTLM (users backend + AD via winbind) | [docs/ntlm-authentication.md](docs/ntlm-authentication.md) |
+| PAM/local (generated + hand-written stacks) | [docs/pam-authentication.md](docs/pam-authentication.md) |
+| Kerberos (provisioned + classic keytab setup) | [docs/kerberos-authentication.md](docs/kerberos-authentication.md) |
+| OpenID Connect | [docs/openid-authentication.md](docs/openid-authentication.md) |
+| Header authentication / reverse proxies | [docs/header-authentication.md](docs/header-authentication.md) |
+
 ## Authentication
 
 RDPGW wants to be secure when you set it up from the start. It supports several authentication
@@ -93,8 +105,8 @@ For detailed Kerberos setup including keytab generation, DNS requirements, and K
 
 For detailed PAM setup including LDAP integration, container deployment, and compatible clients, see the [PAM Authentication Documentation](docs/pam-authentication.md).
 
-`rdpgw-auth` can either use a hand-written PAM service file (`/etc/pam.d/rdpgw`, the
-classic setup that is never touched unless you opt in) or generate a stacked
+`rdpgw-auth` can either use a hand-written PAM service file (`/etc/pam.d/<service>`,
+the classic setup that is never touched unless you opt in) or generate a stacked
 backend pipeline (winbind, LDAP, local unix users, static YAML users, each
 optionally gated by OATH 2FA) from a single `AuthProtocols.Basic` configuration.
 

@@ -217,7 +217,7 @@ Kerberos SPNEGO in `rdpgw` requires that Samba's machine credentials sync automa
   - If `smb.conf` is dynamically generated: Go renders the directives directly into the template.
   - If `smb.conf` is operator-mounted: Go inspects the file content. If `dedicated keytab file`, `sync machine password to keytab`, or `winbind separator = \\` are missing, or if they point to different files than configured:
     - Go attempts to append/fix them if writable.
-    - If the file is mounted read-only and missing these directives or misconfigured, **`auth` explodes and terminates immediately (`log.Fatalf`)** with an actionable fatal error containing instructions on how to configure or call services.
+    - If the file is mounted read-only and missing these directives or misconfigured, **`auth` terminates immediately (`log.Fatalf`)** with an actionable fatal error containing instructions on how to configure or call services.
 
 ### 4.3 Embedded Templates (`cmd/auth/provisioning/templates/`)
 Using Go `embed` (`//go:embed`):
@@ -286,7 +286,7 @@ For the `users` backend (static YAML credentials) to work within the PAM `Basic`
     - If present: Start retry loop with configurable `JoinTimeout` (default 10 minutes) and exponential backoff (2s up to 30s).
     - If credentials are absent or join fails after timeout: **Explode and terminate immediately (`log.Fatalf`)** with an error message detailing how to provide credentials or join manually.
   - **If `AutoJoin: false`**:
-    - Do not attempt automatic join. Enter a wait loop lasting `JoinTimeout` minutes, reporting as the first log message clear instructions on how to perform that manual join (e.g., `net ads join -U Administrator`), and clarifying that the daemon is waiting for it. If timeout expires without join, **explode (`log.Fatalf`)**.
+    - Do not attempt automatic join. Enter a wait loop lasting `JoinTimeout` minutes, reporting as the first log message clear instructions on how to perform that manual join (e.g., `net ads join -U Administrator`), and clarifying that the daemon is waiting for it. If timeout expires without join, **exit (`log.Fatalf`)**.
 
 ### 5.2 Subprocess Supervision (`cmd/auth/supervisor/`)
 - Executed via an operator-configurable command / arguments (e.g. supporting custom debug levels like `-d 5` instead of hardcoded `-d 2`).
@@ -398,5 +398,5 @@ musl-based image (no NSS). See `docs/pam-authentication.md`.
 3. Verify logs via SSH:
    - Config file rendering in `/tmp/rdpgw/`.
    - `net ads testjoin` execution and `winbindd` process supervision with custom verbosity.
-   - Keytab sync line verification in `smb.conf` (or explode check on read-only mount).
+   - Keytab sync line verification in `smb.conf` (or startup-failure check on read-only mount).
    - Successful authentication from Android RD Client (Basic auth) and Windows `mstsc` (NTLM & Kerberos).

@@ -32,7 +32,7 @@ In containerized environments (Kubernetes/Docker), pods receive ephemeral, rando
 ### Scope
 - Implement file staging in `/tmp/rdpgw/` and mount safety checks (detecting read-only operator mounts).
 - Build the Go template engine using embedded templates (`smb.conf.tmpl`, `krb5.conf.tmpl`).
-- Implement the strict explode policy (`log.Fatalf`) when the required generated `[global]` settings cannot be applied to an operator-mounted `smb.conf` (read-only volume, or a `[global]` section ending in a continuation backslash), or when an operator value differs from the generated one. Missing settings are appended; existing values are never overwritten, and drift terminates the daemon with an error naming every conflict.
+- Implement the strict startup-failure policy (`log.Fatalf`) when the required generated `[global]` settings cannot be applied to an operator-mounted `smb.conf` (read-only volume, or a `[global]` section ending in a continuation backslash), or when an operator value differs from the generated one. Missing settings are appended; existing values are never overwritten, and drift terminates the daemon with an error naming every conflict.
 
 ### Deliverables
 - Embedded template assets in `cmd/auth/provisioning/templates/` (`smb.conf.tmpl`, `krb5.conf.tmpl`, embedded via `//go:embed templates/*.tmpl`).
@@ -69,7 +69,7 @@ Go supervisor before the join logic moves.
 - Delivered on `feature/milestone-3b-domain-join`.
 
 #### Scope
-- Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop (2s → 30s), configurable `JoinTimeout` (default 10 min), and explicit failure explosion (`log.Fatalf`) with clear troubleshooting instructions when unjoined. `autoJoin: false` waits for a manual join and prints the instructions immediately.
+- Implement `net ads testjoin` pre-checks, exponential backoff auto-join loop (2s → 30s), configurable `JoinTimeout` (default 10 min), and explicit startup failure (`log.Fatalf`) with clear troubleshooting instructions when unjoined. `autoJoin: false` waits for a manual join and prints the instructions immediately.
 - Run the join in the root supervisor before `winbindd` starts (external-winbind deployments delegate the join to the host).
 - Migrate the join/wait logic out of `run-auth-winbind.sh` into `cmd/auth/join/`.
 - Migrate keytab creation and SPN management into `cmd/auth/join/`: refresh the keytab (`net ads keytab create -P`), collect SPNs from `AuthProtocols.Kerberos.Spns` (legacy `ntlm.winbind.spns` maps there), `KERBEROS_SPNS` and `HTTP/<GatewayAddress>` from `RDPGW_CONF`, register missing SPNs with the join credentials, otherwise print manual instructions and wait for them to appear in `klist -k`, then make the keytab readable by the gateway (0644).

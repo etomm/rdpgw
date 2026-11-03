@@ -56,7 +56,7 @@ setup details.
 The entrypoint is the `rdpgw-auth` daemon itself, which fully provisions the
 container at startup: staged/reconciled `smb.conf` and `krb5.conf`, the
 generated PAM stack when `AuthProtocols.Basic` is enabled, the domain join
-(`AD_JOIN_USER`/`AD_JOIN_PASSWORD` with `Winbind.autojoin: true`, or a clean
+(`AD_JOIN_USER`/`AD_JOIN_PASSWORD` with `Winbind.AutoJoin: true`, or a clean
 wait for a manual join), shared keytab refresh and SPN registration, and then
 `winbindd` supervision (`wbinfo -p` readiness, graceful stop on SIGTERM) with
 the gRPC server running as UID 1001. There is no shell startup script and no
@@ -95,7 +95,7 @@ ways to provide that:
    ```
 
    Keep the machine account name stable
-   (`Winbind.hostname: rdpgw-auth` in the configuration): it is the computer account name in the domain.
+   (`Winbind.Hostname: rdpgw-auth` in the configuration): it is the computer account name in the domain.
 
 2. **Use the winbind of a domain-joined Docker host.** Set
    `RDPGW_AUTH_EXTERNAL_WINBIND=1` and mount the host's `/run/samba` and

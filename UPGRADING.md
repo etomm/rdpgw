@@ -42,25 +42,41 @@ going forward.
 ```yaml
 AuthProtocols:
   Kerberos:  # shared keytab for the gateway + SPN management
-    share: true
-    keytabPath: /var/lib/samba/rdpgw.keytab
-    spns: [HTTP/rdpgw.example.com]
+    Share: true
+    KeytabPath: /var/lib/samba/rdpgw.keytab
+    Spns: [HTTP/rdpgw.example.com]
   Ntlm:      # ordered NTLM verifiers: winbind and/or users
-    enabled: true
-    backends: [winbind, users]
+    Enabled: true
+    Backends: [winbind, users]
   Basic:     # generated PAM stack: winbind, ldap, unix, users (+ OATH 2FA)
-    enabled: true
-    stack: [{backend: unix}]
+    Enabled: true
+    Stack: [{Backend: unix}]
 ```
 
 Legacy configurations keep working unchanged: without an `AuthProtocols`
 block the legacy `Ntlm:` schema is mapped automatically (`Ntlm.Backend:
 winbind` also enables the Kerberos keytab share; `Ntlm.Winbind.Spns` move to
 `AuthProtocols.Kerberos.Spns`; `Ntlm.Winbind.Domain` maps to the modern
-`Winbind.workgroup`, so a FQDN now belongs in `Winbind.domain`). Multiple
+`Winbind.Workgroup`, so a FQDN now belongs in `Winbind.Domain`). Multiple
 NTLM backends are tried in configured order per handshake; a backend chain
 that cannot be built is an explicit denial instead of a silent fallback.
 See [docs/advanced-auth-configuration.md](docs/advanced-auth-configuration.md).
+
+**Winbind.Domain is required** when `rdpgw-auth` provisions `smb.conf` or
+`krb5.conf` (any winbind-capable deployment). The generated `realm` /
+`default_realm` is the DNS/Kerberos realm, not the NetBIOS workgroup; the
+daemon no longer substitutes the workgroup for a missing realm. Legacy
+NetBIOS-only configurations (`Ntlm.Winbind.Domain: EXAMPLE`) must add a
+top-level:
+
+```yaml
+Winbind:
+  domain: corp.example.com
+```
+
+or keep mounting their own complete `smb.conf`/`krb5.conf`. Pointing the
+daemon at a host-provided winbind (`RDPGW_AUTH_EXTERNAL_WINBIND=1`) does not
+remove this requirement: provisioning still reconciles the client-side files.
 
 ### rdpgw-auth provisions `smb.conf` and `krb5.conf` (strict drift policy)
 
@@ -91,11 +107,11 @@ joining:
 
 If you mount a hand-written `smb.conf` into the winbind container, make sure
 it carries the same values the configuration produces (realm, workgroup,
-`netbios name` via `Winbind.hostname`, separator, and with a keytab share
+`netbios name` via `Winbind.Hostname`, separator, and with a keytab share
 `kerberos method` / `dedicated keytab file` / `sync machine password to
 keytab`), or leave it out and let the daemon generate it. Advanced settings
-such as `Winbind.hostname`, `Winbind.domaincontrollers`, `autojoin`,
-`jointimeout` and `requiremembershipof` feed the generated files. Only a
+such as `Winbind.Hostname`, `Winbind.DomainControllers`, `AutoJoin`,
+`JoinTimeout` and `RequireMembershipOf` feed the generated files. Only a
 strict-mode (there: container) deployment stops on drift; `--relaxed`
 deployments degrade loudly instead of crash-looping over a mount they
 cannot rewrite.
@@ -103,14 +119,15 @@ cannot rewrite.
 ### PAM stack generation and overwrite when `AuthProtocols.Basic` is enabled
 
 Enabling `AuthProtocols.Basic` makes `rdpgw-auth` generate
-`/etc/pam.d/rdpgw` on every start together with `/tmp/rdpgw/users.pwd`
-(SHA-512 crypt of the YAML `Users`), per-profile LDAP client files and
-`/opt/rdpgw/session_manager.sh` (a `pam_exec` helper that keeps the PAM
-account phase on the backend that won the auth phase). Local edits to the
-generated file are overwritten.
+`/etc/pam.d/<service>` on every start (default `/etc/pam.d/rdpgw`). It also
+writes `/opt/rdpgw/session_manager.sh` (a `pam_exec` helper that keeps the PAM
+account phase on the backend that won the auth phase), `/tmp/rdpgw/users.pwd`
+(SHA-512 crypt of the YAML `Users`) only when the stack contains a `users`
+entry, and LDAP client files only for `Ldap` profiles referenced by the stack.
+Local edits to the generated file are overwritten.
 
 **Not enabling `AuthProtocols.Basic` is the legacy behavior**: the daemon
-never touches `/etc/pam.d/rdpgw`, so hand-written PAM configurations,
+never touches `/etc/pam.d/<service>`, so hand-written PAM configurations,
 traditional `pam_ldap.conf`-based LDAP stacks and custom module setups keep
 working untouched.
 
@@ -118,7 +135,7 @@ working untouched.
 
 Previously the container joined (or waited indefinitely) based on whether
 `AD_JOIN_USER`/`AD_JOIN_PASSWORD` were set in the environment. The policy now
-comes from `Winbind.autojoin` / `Winbind.jointimeout` (default: manual join
+comes from `Winbind.AutoJoin` / `Winbind.JoinTimeout` (default: manual join
 with a 10-minute wait budget, after which the daemon exits with a remediation
 playbook):
 
@@ -128,7 +145,7 @@ playbook):
   waits for an operator `net ads join`, then exits if the budget expires.
 
 Existing Kubernetes secrets with those names keep working; just set
-`Winbind.autojoin: true` to restore the automatic-join behavior.
+`Winbind.AutoJoin: true` to restore the automatic-join behavior.
 
 ### SPN configuration moved to `AuthProtocols.Kerberos.Spns`
 
