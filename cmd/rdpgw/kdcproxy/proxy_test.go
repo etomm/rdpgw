@@ -8,10 +8,10 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
-
-	krbconfig "github.com/bolkedebruin/gokrb5/v8/config"
 )
 
 func frameKerberosMessage(payload []byte) []byte {
@@ -21,23 +21,81 @@ func frameKerberosMessage(payload []byte) []byte {
 	return framed
 }
 
-func newTestKerberosProxy(t *testing.T, kdcAddr string) KerberosProxy {
-	t.Helper()
-	krb5Conf := fmt.Sprintf(`[libdefaults]
-    default_realm = TEST.REALM
+func testKrb5Conf(realm, kdcAddr string) string {
+	return fmt.Sprintf(`[libdefaults]
+    default_realm = %s
     dns_lookup_realm = false
     dns_lookup_kdc = false
 
 [realms]
-    TEST.REALM = {
+    %s = {
         kdc = %s
     }
-`, kdcAddr)
-	cfg, err := krbconfig.NewFromString(krb5Conf)
-	if err != nil {
-		t.Fatalf("failed to parse krb5 config: %v", err)
+`, realm, realm, kdcAddr)
+}
+
+func writeTestKrb5Conf(t *testing.T, path, realm, kdcAddr string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(testKrb5Conf(realm, kdcAddr)), 0o644); err != nil {
+		t.Fatalf("failed to write krb5 config: %v", err)
 	}
-	return KerberosProxy{krb5Config: cfg}
+}
+
+func newTestKerberosProxy(t *testing.T, kdcAddr string) KerberosProxy {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "krb5.conf")
+	writeTestKrb5Conf(t, path, "TEST.REALM", kdcAddr)
+	return InitKdcProxy(path)
+}
+
+// TestKrb5ConfigReloadsOnChange verifies that the KDC proxy picks up a
+// krb5.conf replaced by rdpgw-auth without a gateway restart.
+func TestKrb5ConfigReloadsOnChange(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "krb5.conf")
+	writeTestKrb5Conf(t, path, "ONE.REALM", "127.0.0.1:88")
+	provider := NewDynamicKrb5ConfigProvider(path)
+
+	cfg, err := provider.GetConfig()
+	if err != nil {
+		t.Fatalf("initial GetConfig: %v", err)
+	}
+	if got := cfg.LibDefaults.DefaultRealm; got != "ONE.REALM" {
+		t.Fatalf("initial realm = %q, want ONE.REALM", got)
+	}
+
+	writeTestKrb5Conf(t, path, "TWO.REALM", "127.0.0.1:89")
+	future := time.Now().Add(2 * time.Second)
+	if err := os.Chtimes(path, future, future); err != nil {
+		t.Fatalf("failed to update modtime: %v", err)
+	}
+
+	cfg, err = provider.GetConfig()
+	if err != nil {
+		t.Fatalf("reloaded GetConfig: %v", err)
+	}
+	if got := cfg.LibDefaults.DefaultRealm; got != "TWO.REALM" {
+		t.Fatalf("reloaded realm = %q, want TWO.REALM", got)
+	}
+}
+
+// TestKrb5ConfigAppearsAfterStartup verifies that a shared krb5.conf written
+// after the gateway starts is picked up by subsequent requests.
+func TestKrb5ConfigAppearsAfterStartup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "krb5.conf")
+	provider := NewDynamicKrb5ConfigProvider(path)
+
+	if _, err := provider.GetConfig(); err == nil {
+		t.Fatal("expected an error while the shared krb5.conf does not exist")
+	}
+
+	writeTestKrb5Conf(t, path, "LATE.REALM", "127.0.0.1:88")
+	cfg, err := provider.GetConfig()
+	if err != nil {
+		t.Fatalf("GetConfig after file appeared: %v", err)
+	}
+	if got := cfg.LibDefaults.DefaultRealm; got != "LATE.REALM" {
+		t.Fatalf("realm = %q, want LATE.REALM", got)
+	}
 }
 
 // TestAwaitReplyUDP verifies that UDP KDC replies are read from a single

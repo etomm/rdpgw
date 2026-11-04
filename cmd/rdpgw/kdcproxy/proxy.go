@@ -8,6 +8,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"sync"
 	"time"
 
 	krbconfig "github.com/bolkedebruin/gokrb5/v8/config"
@@ -33,8 +35,63 @@ type Kdc struct {
 	Conn  net.Conn
 }
 
+// DynamicKrb5ConfigProvider reloads the krb5.conf file whenever its modtime
+// or size changes on disk. rdpgw-auth publishes the file into the shared
+// keytab volume, and the gateway may start before or after that write.
+type DynamicKrb5ConfigProvider struct {
+	path     string
+	mu       sync.RWMutex
+	lastMod  time.Time
+	lastSize int64
+	cached   *krbconfig.Config
+}
+
+func NewDynamicKrb5ConfigProvider(path string) *DynamicKrb5ConfigProvider {
+	return &DynamicKrb5ConfigProvider{path: path}
+}
+
+func (p *DynamicKrb5ConfigProvider) GetConfig() (*krbconfig.Config, error) {
+	p.mu.RLock()
+	st, err := os.Stat(p.path)
+	if err == nil && p.cached != nil && st.ModTime().Equal(p.lastMod) && st.Size() == p.lastSize {
+		cfg := p.cached
+		p.mu.RUnlock()
+		return cfg, nil
+	}
+	p.mu.RUnlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	st, err = os.Stat(p.path)
+	if err != nil {
+		if p.cached != nil {
+			return p.cached, nil
+		}
+		return nil, err
+	}
+	if p.cached != nil && st.ModTime().Equal(p.lastMod) && st.Size() == p.lastSize {
+		return p.cached, nil
+	}
+
+	cfg, err := krbconfig.Load(p.path)
+	if err != nil {
+		log.Printf("krb5 config reload from %s failed: %v", p.path, err)
+		if p.cached != nil {
+			return p.cached, nil
+		}
+		return nil, err
+	}
+
+	log.Printf("Loaded krb5 config from %s (modtime: %s)", p.path, st.ModTime().Format(time.RFC3339))
+	p.lastMod = st.ModTime()
+	p.lastSize = st.Size()
+	p.cached = cfg
+	return p.cached, nil
+}
+
 type KerberosProxy struct {
-	krb5Config *krbconfig.Config
+	configProvider *DynamicKrb5ConfigProvider
 }
 
 func InitKdcProxy(krb5Conf string) KerberosProxy {
@@ -42,14 +99,24 @@ func InitKdcProxy(krb5Conf string) KerberosProxy {
 	if krb5Conf != "" {
 		path = krb5Conf
 	}
-	cfg, err := krbconfig.Load(path)
-	if err != nil {
-		log.Fatalf("Cannot load krb5 config %s due to %s", path, err)
+	provider := NewDynamicKrb5ConfigProvider(path)
+	if _, err := provider.GetConfig(); err != nil {
+		// Do not exit here: the shared volume is written by rdpgw-auth and
+		// may appear shortly after startup. The first requests return 503
+		// until the file can be loaded.
+		log.Printf("WARNING: cannot load krb5 config %s yet: %s; KDC proxy will retry", path, err)
 	}
 
 	return KerberosProxy{
-		krb5Config: cfg,
+		configProvider: provider,
 	}
+}
+
+func (k KerberosProxy) currentConfig() (*krbconfig.Config, error) {
+	if k.configProvider == nil {
+		return nil, errors.New("KDC proxy has no krb5 config provider")
+	}
+	return k.configProvider.GetConfig()
 }
 
 func (k KerberosProxy) Handler(w http.ResponseWriter, r *http.Request) {
@@ -113,8 +180,12 @@ func (k *KerberosProxy) forward(realm string, data []byte) (resp []byte, err err
 		return nil, fmt.Errorf("kerberos message too short (%d bytes)", len(data))
 	}
 
+	cfg, err := k.currentConfig()
+	if err != nil {
+		return nil, fmt.Errorf("cannot load krb5 config: %w", err)
+	}
 	if realm == "" {
-		realm = k.krb5Config.LibDefaults.DefaultRealm
+		realm = cfg.LibDefaults.DefaultRealm
 	}
 
 	// Prefer TCP KDCs first: MS-KKDCP messages are already framed with a
@@ -123,7 +194,7 @@ func (k *KerberosProxy) forward(realm string, data []byte) (resp []byte, err err
 	// ticket with PAC exceeds ~1465 bytes. Since KDC Proxy clients cannot
 	// force the proxy to switch transports on retry, racing UDP against TCP
 	// causes UDP's ERR_RESPONSE_TOO_BIG to win the race and break logon.
-	_, tcpKdcs, err := k.krb5Config.GetKDCs(realm, true)
+	_, tcpKdcs, err := cfg.GetKDCs(realm, true)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get tcp kdc for realm %s due to %s", realm, err)
 	}
@@ -139,7 +210,7 @@ func (k *KerberosProxy) forward(realm string, data []byte) (resp []byte, err err
 	}
 
 	// Fall back to UDP only if TCP KDCs did not respond
-	_, udpKdcs, err := k.krb5Config.GetKDCs(realm, false)
+	_, udpKdcs, err := cfg.GetKDCs(realm, false)
 	if err != nil {
 		return nil, fmt.Errorf("cannot get udp kdc for realm %s due to %s", realm, err)
 	}

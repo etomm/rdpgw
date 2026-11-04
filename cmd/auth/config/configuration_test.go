@@ -94,9 +94,10 @@ Ntlm:
 		},
 		AuthProtocols: &AuthProtocolsConfig{
 			Kerberos: &KerberosProtocolConfig{
-				Share:      true,
-				KeytabPath: DefaultSharedKeytab,
-				Spns:       []string{"HTTP/rdpgw.example.com"}, // moved out of the legacy winbind block
+				Share:        true,
+				KeytabPath:   DefaultSharedKeytab,
+				Krb5ConfPath: DefaultSharedKrb5Conf,
+				Spns:         []string{"HTTP/rdpgw.example.com"}, // moved out of the legacy winbind block
 			},
 			Ntlm: &NtlmProtocolConfig{
 				Enabled:  true,
@@ -106,6 +107,65 @@ Ntlm:
 	}
 	if !reflect.DeepEqual(c, want) {
 		t.Errorf("got %+v, want backend winbind with %+v", toJSON(c), toJSON(want))
+	}
+}
+
+func TestLoadDerivesSharedKrb5ConfPath(t *testing.T) {
+	dir := t.TempDir()
+	helper := writeFile(t, dir, "ntlm_auth", "#!/bin/sh\n")
+	tests := []struct {
+		name       string
+		kerberos   string
+		wantKeytab string
+		wantKrb5   string
+	}{
+		{
+			name:       "keytab default",
+			kerberos:   "Share: true",
+			wantKeytab: DefaultSharedKeytab,
+			wantKrb5:   DefaultSharedKrb5Conf,
+		},
+		{
+			name: "custom keytab",
+			kerberos: `Share: true
+    KeytabPath: /srv/rdpgw/custom.keytab`,
+			wantKeytab: "/srv/rdpgw/custom.keytab",
+			wantKrb5:   "/srv/rdpgw/krb5.conf",
+		},
+		{
+			name: "explicit krb5 path wins",
+			kerberos: `Share: true
+    KeytabPath: /srv/rdpgw/custom.keytab
+    Krb5ConfPath: /etc/rdpgw/krb5.conf`,
+			wantKeytab: "/srv/rdpgw/custom.keytab",
+			wantKrb5:   "/etc/rdpgw/krb5.conf",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := writeFile(t, t.TempDir(), "rdpgw-auth.yaml", `
+Winbind:
+  NtlmAuthPath: `+helper+`
+  Domain: corp.example.com
+AuthProtocols:
+  Kerberos:
+    `+tc.kerberos+`
+  Ntlm:
+    Enabled: true
+    Backends:
+      - winbind
+`)
+			c, err := load(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if c.AuthProtocols.Kerberos.KeytabPath != tc.wantKeytab {
+				t.Errorf("KeytabPath = %q, want %q", c.AuthProtocols.Kerberos.KeytabPath, tc.wantKeytab)
+			}
+			if c.AuthProtocols.Kerberos.Krb5ConfPath != tc.wantKrb5 {
+				t.Errorf("Krb5ConfPath = %q, want %q", c.AuthProtocols.Kerberos.Krb5ConfPath, tc.wantKrb5)
+			}
+		})
 	}
 }
 
@@ -349,6 +409,8 @@ func TestValidate(t *testing.T) {
 		{"missing NtlmAuthPath path", Configuration{Winbind: &WinbindConfig{Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "NtlmAuthPath must be set"},
 		{"nonexistent path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: nonExistentHelper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "is not usable"},
 		{"zero timeout", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 0}, AuthProtocols: &AuthProtocolsConfig{Ntlm: &NtlmProtocolConfig{Enabled: true, Backends: []string{NtlmBackendWinbind}}}}, "Timeout must be positive"},
+		{"missing keytab path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true}}}, "Kerberos.KeytabPath must be set"},
+		{"missing shared krb5 path", Configuration{Winbind: &WinbindConfig{NtlmAuthPath: helper, Timeout: 1}, AuthProtocols: &AuthProtocolsConfig{Kerberos: &KerberosProtocolConfig{Share: true, KeytabPath: DefaultSharedKeytab}}}, "Kerberos.Krb5ConfPath must be set"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

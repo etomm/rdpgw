@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path"
 	"strings"
 
 	"github.com/mitchellh/copystructure"
@@ -32,9 +33,12 @@ const (
 	// continues onto the next line); see cmd/auth/provisioning.
 	DefaultSeparator    SingleChar = '\\'
 	DefaultSharedKeytab            = "/var/lib/samba/rdpgw.keytab"
-	DefaultKdcPort                 = 88
-	DefaultKdcAdminPort            = 749
-	DefaultStripDomain             = false
+	// DefaultSharedKrb5Conf is the published path when the default keytab is
+	// used; normally the shared krb5.conf sits next to the configured keytab.
+	DefaultSharedKrb5Conf = "/var/lib/samba/krb5.conf"
+	DefaultKdcPort        = 88
+	DefaultKdcAdminPort   = 749
+	DefaultStripDomain    = false
 )
 
 // DefaultConfig holds the default configuration values applied via yaml.
@@ -105,6 +109,11 @@ type AuthProtocolsConfig struct {
 type KerberosProtocolConfig struct {
 	Share      bool   `json:"share" yaml:"share"`
 	KeytabPath string `json:"keytabpath" yaml:"keytabpath"`
+	// Krb5ConfPath is where rdpgw-auth publishes the generated krb5.conf for
+	// the gateway when Share is true. Empty means next to the shared keytab
+	// (dir(KeytabPath)/krb5.conf); the default keytab therefore publishes to
+	// /var/lib/samba/krb5.conf.
+	Krb5ConfPath string `json:"krb5confpath" yaml:"krb5confpath"`
 	// Spns is the list of Kerberos Service Principal Names to register in
 	// Active Directory and keep present in the shared keytab. SPNs are a
 	// Kerberos concern: without a keytab share there is nothing to register,
@@ -266,6 +275,18 @@ func load(configFile string) (Configuration, error) {
 		c.Winbind.Workgroup = strings.ToUpper(parts[0])
 	}
 
+	// The keytab and the generated krb5.conf are both published for the
+	// gateway. Apply the documented keytab default first, then derive the
+	// krb5.conf path from it unless the operator set one explicitly.
+	if c.AuthProtocols != nil && c.AuthProtocols.Kerberos != nil && c.AuthProtocols.Kerberos.Share {
+		if c.AuthProtocols.Kerberos.KeytabPath == "" {
+			c.AuthProtocols.Kerberos.KeytabPath = DefaultSharedKeytab
+		}
+		if c.AuthProtocols.Kerberos.Krb5ConfPath == "" {
+			c.AuthProtocols.Kerberos.Krb5ConfPath = path.Join(path.Dir(c.AuthProtocols.Kerberos.KeytabPath), "krb5.conf")
+		}
+	}
+
 	return c, c.Validate()
 }
 
@@ -287,6 +308,9 @@ func (c *Configuration) Validate() error {
 	if hasKerberos {
 		if kerberos.KeytabPath == "" {
 			return errors.New("AuthProtocols.Kerberos.KeytabPath must be set when you are sharing Kerberos")
+		}
+		if kerberos.Krb5ConfPath == "" {
+			return errors.New("AuthProtocols.Kerberos.Krb5ConfPath must be set when you are sharing Kerberos")
 		}
 	}
 

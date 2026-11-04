@@ -67,6 +67,25 @@ AuthProtocols:
         oath: "default-totp"
 ```
 
+## Kerberos keytab sharing
+
+With `AuthProtocols.Kerberos.Share: true`, `rdpgw-auth` keeps the Samba
+machine keytab in `KeytabPath` and publishes the generated `krb5.conf` for
+the gateway in `Krb5ConfPath`. When `Krb5ConfPath` is omitted it defaults to
+`<KeytabPath directory>/krb5.conf`; with the default keytab that is
+`/var/lib/samba/krb5.conf`. Point the gateway's `Kerberos.Krb5conf` at the same
+shared path; the gateway reloads it when the file changes.
+
+```yaml
+AuthProtocols:
+  Kerberos:
+    Share: true
+    KeytabPath: /var/lib/samba/rdpgw.keytab
+    Krb5ConfPath: /var/lib/samba/krb5.conf # optional; default is next to the keytab
+    Spns:
+      - HTTP/rdpgw.example.com
+```
+
 ## Backward Compatibility
 
 For backward compatibility with existing deployments, legacy configurations such as:

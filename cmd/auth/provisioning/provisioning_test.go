@@ -35,8 +35,9 @@ func modernWinbindConf(t *testing.T) config.Configuration {
 		},
 		AuthProtocols: &config.AuthProtocolsConfig{
 			Kerberos: &config.KerberosProtocolConfig{
-				Share:      true,
-				KeytabPath: "/var/lib/samba/rdpgw.keytab",
+				Share:        true,
+				KeytabPath:   "/var/lib/samba/rdpgw.keytab",
+				Krb5ConfPath: filepath.Join(t.TempDir(), "shared-krb5.conf"),
 			},
 			Ntlm: &config.NtlmProtocolConfig{
 				Enabled:  true,
@@ -58,8 +59,9 @@ func legacyConf(t *testing.T) config.Configuration {
 		},
 		AuthProtocols: &config.AuthProtocolsConfig{
 			Kerberos: &config.KerberosProtocolConfig{
-				Share:      true,
-				KeytabPath: config.DefaultSharedKeytab,
+				Share:        true,
+				KeytabPath:   config.DefaultSharedKeytab,
+				Krb5ConfPath: filepath.Join(t.TempDir(), "shared-krb5.conf"),
 			},
 			Ntlm: &config.NtlmProtocolConfig{
 				Enabled:  true,
@@ -175,6 +177,13 @@ func TestProvisionInstallsTargetsWhenAbsent(t *testing.T) {
 			if want, _ := os.ReadFile(stkrb5); string(krb5) != string(want) {
 				t.Errorf("krb5.conf not a copy of the staged template:\n%s", krb5)
 			}
+			shared, err := os.ReadFile(tc.conf.AuthProtocols.Kerberos.Krb5ConfPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(shared) != string(krb5) {
+				t.Errorf("published krb5.conf differs from the reconciled file:\n%s", shared)
+			}
 			for _, want := range tc.wants {
 				if !strings.Contains(string(smb), want) {
 					t.Errorf("smb.conf missing %q:\n%s", want, smb)
@@ -236,6 +245,19 @@ func TestProvisionMergesIntoWritableOperatorFile(t *testing.T) {
 	}
 	if strings.Count(got, "security =") != 1 {
 		t.Errorf("existing operator settings must not be duplicated:\n%s", got)
+	}
+}
+
+func TestProvisionDoesNotPublishKrb5WithoutShare(t *testing.T) {
+	conf := modernWinbindConf(t)
+	conf.AuthProtocols.Kerberos.Share = false
+	shared := conf.AuthProtocols.Kerberos.Krb5ConfPath
+	p := optsFor(t)
+	if err := provision(conf, p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(shared); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("krb5.conf must only be published when the keytab is shared, stat = %v", err)
 	}
 }
 

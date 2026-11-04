@@ -140,6 +140,35 @@ Kerberos:
   Krb5conf: /etc/kerberos/krb5.conf
 ```
 
+#### Shared keytab and krb5.conf
+When `rdpgw-auth` shares the keytab (`AuthProtocols.Kerberos.Share: true`), it
+also publishes the generated `krb5.conf` for the gateway. The destination is
+`AuthProtocols.Kerberos.Krb5ConfPath`; when it is unset, the file is written
+next to the shared keytab as `krb5.conf` (so the default keytab publishes to
+`/var/lib/samba/krb5.conf`). Both files then travel through the same shared
+volume:
+
+```yaml
+# rdpgw-auth.yaml
+AuthProtocols:
+  Kerberos:
+    Share: true
+    KeytabPath: /var/lib/samba/rdpgw.keytab
+    # Krb5ConfPath defaults to /var/lib/samba/krb5.conf
+```
+
+```yaml
+# rdpgw.yaml
+Kerberos:
+  Keytab: /var/lib/samba/rdpgw.keytab
+  Krb5conf: /var/lib/samba/krb5.conf
+```
+
+The gateway reloads `krb5.conf` when its modtime or size changes, so KDC or
+realm updates published by `rdpgw-auth` are picked up without restarting the
+gateway. If the file does not exist yet, the KDC proxy keeps running and
+retries on subsequent requests instead of failing at startup.
+
 #### Dynamic Keytab Loading & SPN Management
 When deploying with Active Directory winbind (`rdpgw-auth-winbind`), RDPGW supports dynamic keytab reloading. The gateway automatically detects updates to the keytab file (e.g. when Samba refreshes the machine account keytab or adds SPNs).
 

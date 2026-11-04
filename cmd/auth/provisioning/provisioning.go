@@ -88,6 +88,9 @@ func Provision(conf config.Configuration) error {
 		// every winbind-capable deployment); guarded for direct callers.
 		return fmt.Errorf("provisioning: winbind capability requested but the Winbind configuration block is missing")
 	}
+	if err := conf.Validate(); err != nil {
+		return fmt.Errorf("provisioning: invalid configuration: %w", err)
+	}
 	return provision(conf, provisionOptions{
 		StageDir:   defaultStageDir,
 		SmbTarget:  defaultSmbTarget,
@@ -138,7 +141,89 @@ func provision(conf config.Configuration, p provisionOptions) error {
 	if err := reconcile(smbStaged, p.SmbTarget, true, smbConfSemanticallyEqual); err != nil {
 		return err
 	}
-	return reconcile(krb5Staged, p.Krb5Target, false, krb5ConfSemanticallyEqual)
+	if err := reconcile(krb5Staged, p.Krb5Target, false, krb5ConfSemanticallyEqual); err != nil {
+		return err
+	}
+	return publishSharedKrb5(conf, p)
+}
+
+// publishSharedKrb5 copies the final reconciled krb5.conf to the shared
+// Krb5ConfPath so the gateway can load it from the same volume as the keytab.
+// Publishing the final file, not the staged template, preserves any settings an
+// operator merged into the auth-side target. The write is atomic because rdpgw
+// watches the published file and may reload it at any time.
+func publishSharedKrb5(conf config.Configuration, p provisionOptions) error {
+	kerberos := conf.AuthProtocols.Kerberos
+	if kerberos == nil || !kerberos.Share {
+		return nil
+	}
+	target := kerberos.Krb5ConfPath
+	if samePath(p.Krb5Target, target) {
+		return nil
+	}
+
+	data, err := os.ReadFile(p.Krb5Target)
+	if err != nil {
+		return fmt.Errorf("provisioning: cannot read %s for the shared krb5.conf: %w", p.Krb5Target, err)
+	}
+	if err := writeStagedFile(target, data, 0o644); err != nil {
+		return fmt.Errorf("provisioning: cannot publish shared krb5.conf %s: %w", target, err)
+	}
+	log.Printf("Provisioning: published shared krb5.conf at %s", target)
+	return nil
+}
+
+func samePath(a, b string) bool {
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	if errA == nil && errB == nil {
+		return filepath.Clean(absA) == filepath.Clean(absB)
+	}
+	return filepath.Clean(a) == filepath.Clean(b)
+}
+
+// writeFileAtomic writes data to path via a temporary file in the same
+// directory, then renames it into place. Readers therefore never observe a
+// partially written file. On Windows, where rename cannot replace an existing
+// destination, the old file is removed first.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+"-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+
+	if err := os.Rename(tmpName, path); err != nil {
+		// Windows does not replace an existing destination atomically.
+		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return err
+		}
+		if err := os.Rename(tmpName, path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // buildSmbData fills the smb.conf template view model from any schema
@@ -446,5 +531,6 @@ func insertAtGlobalEnd(content string, lines []string) string {
 
 // writeStagedFile is swappable in tests so read-only mounts can be simulated
 // deterministically (a real read-only mount needs privileges unavailable on
-// CI).
-var writeStagedFile = os.WriteFile
+// CI). It is also used for the published krb5.conf so both writes share the
+// same atomic implementation.
+var writeStagedFile = writeFileAtomic
