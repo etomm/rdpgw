@@ -25,8 +25,14 @@ FROM alpine:latest
 # ntlm_auth and wbinfo, samba-common-tools provides net (for "net ads join"),
 # ldb-tools provides ldb tools for secrets.ldb initialization,
 # and krb5 is needed to join and talk to the domain.
+#
+# The samba/krb5 packages ship stock smb.conf and krb5.conf examples
+# (workgroup = MYGROUP, no default realm). rdpgw-auth provisions both files
+# itself, so remove the package samples instead of treating them as operator
+# configuration and reporting drift at startup.
 RUN apk --no-cache add linux-pam musl tzdata ca-certificates \
         samba-winbind samba-winbind-clients samba-common-tools ldb-tools krb5 su-exec yq-go && \
+    rm -f /etc/samba/smb.conf /etc/krb5.conf && \
     addgroup -S winbindd_priv && \
     adduser -D -H -h /opt/rdpgw -u 1001 rdpgw && \
     addgroup rdpgw winbindd_priv
