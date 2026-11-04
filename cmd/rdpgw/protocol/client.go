@@ -38,7 +38,7 @@ func (c *ClientConfig) ConnectAndForward() error {
 
 		for _, message := range messages {
 			if message.err != nil {
-				log.Printf("Cannot read message from stream %p", err)
+				log.Printf("Cannot read message from stream: %v", message.err)
 				continue
 			}
 			switch message.packetType {

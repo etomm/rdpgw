@@ -47,13 +47,13 @@ func (p *Processor) Process(ctx context.Context) error {
 		//pt, sz, pkt, err := p.tunnel.Read()
 		messages, err := p.tunnel.Read()
 		if err != nil {
-			log.Printf("Cannot read message from stream %p", err)
+			log.Printf("Cannot read message from stream: %v", err)
 			return err
 		}
 
 		for _, message := range messages {
 			if message.err != nil {
-				log.Printf("Cannot read message from stream %p", err)
+				log.Printf("Cannot read message from stream: %v", message.err)
 				continue
 			}
 			switch message.packetType {
@@ -139,6 +139,10 @@ func (p *Processor) Process(ctx context.Context) error {
 					}
 				}
 				log.Printf("Establishing connection to RDP server: %s", host)
+				if p.tunnel.rwc != nil {
+					_ = p.tunnel.rwc.Close()
+					p.tunnel.rwc = nil
+				}
 				p.tunnel.rwc, err = net.DialTimeout("tcp", host, time.Second*15)
 				if err != nil {
 					log.Printf("Error connecting to %s, %s", host, err)
@@ -173,14 +177,24 @@ func (p *Processor) Process(ctx context.Context) error {
 				// p.transportIn.Write(createPacket(PKT_TYPE_KEEPALIVE, []byte{}))
 			case PKT_TYPE_CLOSE_CHANNEL:
 				log.Printf("Close channel")
-				if p.state != SERVER_STATE_OPENED {
-					log.Printf("Channel closed while in wrong state %d != %d", p.state, SERVER_STATE_OPENED)
-					return errors.New("wrong state")
+				if p.state != SERVER_STATE_OPENED && p.state != SERVER_STATE_CHANNEL_CREATE {
+					log.Printf("Channel closed while in wrong state %d", p.state)
+					continue
 				}
 				msg := p.channelCloseResponse(ERROR_SUCCESS)
 				p.tunnel.Write(msg)
-				p.state = SERVER_STATE_CLOSED
-				return nil
+				// A tunnel can carry more than one channel. Some clients
+				// (notably the Microsoft Remote Desktop Android client) close
+				// the channel while handling an RDP credential prompt, then
+				// open a new channel on the same tunnel. Keep the tunnel alive
+				// so that retry can succeed; the client closes the transport
+				// when it really is done.
+				if p.tunnel.rwc != nil {
+					_ = p.tunnel.rwc.Close()
+					p.tunnel.rwc = nil
+				}
+				p.state = SERVER_STATE_TUNNEL_AUTHORIZE
+				continue
 			default:
 				log.Printf("Unknown packet (size %d): %x", message.length, message.msg)
 			}
